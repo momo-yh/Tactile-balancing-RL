@@ -1,0 +1,71 @@
+<mujoco model="simple_box">
+  <option timestep="0.002" />
+
+  <default>
+    <!-- Softer, slightly elastic contacts to reduce sensor spikes -->
+    <geom solref="0.03 1.0" solimp="0.5 0.99 0.003 0.5 2" margin="0.002" friction="1 0.2 0.01" density="1000"/>
+  </default>
+
+  <worldbody>
+    <light diffuse=".5 .5 .5" pos="0 0 3" dir="0 0 -1"/>
+  <geom name="ground" type="plane" size="5 5 0.1" rgba="0.8 0.8 0.8 1"/>
+    
+  <body name="box_body" pos="0 0 0.5">
+      <joint type="free"/>
+  <geom name="box_geom" type="box" size="0.1 0.1 0.5" rgba="0 1 0 1" mass="1"/>
+
+  <!-- 3x3 sensor grid on bottom face (x from -0.1 to +0.1, y from +0.1 to -0.1) -->
+  <site name="site_m1_p1" pos="-0.1 0.1 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  <site name="site_m1_0"  pos="-0.1 0.0 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  <site name="site_m1_m1" pos="-0.1 -0.1 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  
+  <site name="site_0_p1"  pos="0.0 0.1 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  <site name="site_0_0"   pos="0.0 0.0 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  <site name="site_0_m1"  pos="0.0 -0.1 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>   
+  
+  <site name="site_p1_p1" pos="0.1 0.1 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  <site name="site_p1_0"  pos="0.1 0.0 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  <site name="site_p1_m1" pos="0.1 -0.1 -0.5" size="0.025" rgba="0.5 0.5 0.5 1"/>
+  
+  <!-- tiny contact geoms colocated with the 3x3 sites so each site can produce a contact -->
+  <!-- Column x = -0.1 (left): top->bottom -->
+  <geom name="touch_m1_p1" type="sphere" pos="-0.1 0.1 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+  <geom name="touch_m1_0"  type="sphere" pos="-0.1 0.0 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+  <geom name="touch_m1_m1" type="sphere" pos="-0.1 -0.1 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+
+  <!-- Column x = 0 (middle): top->bottom -->
+  <geom name="touch_0_p1"  type="sphere" pos="0.0 0.1 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+  <geom name="touch_0_0"   type="sphere" pos="0.0 0.0 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+  <geom name="touch_0_m1"  type="sphere" pos="0.0 -0.1 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+
+  <!-- Column x = +0.1 (right): top->bottom -->
+  <geom name="touch_p1_p1" type="sphere" pos="0.1 0.1 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+  <geom name="touch_p1_0"  type="sphere" pos="0.1 0.0 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+  <geom name="touch_p1_m1" type="sphere" pos="0.1 -0.1 -0.5" size="0.0125" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>
+    </body>
+  </worldbody>
+  
+  <sensor>
+    <!-- Use touch sensors (scalar contact pressure) referencing the small contact geoms -->
+  <!-- Column x = -0.1 (left): top->bottom -->
+  <touch name="sensor_m1_p1" site="site_m1_p1" cutoff="12"/>
+  <touch name="sensor_m1_0"  site="site_m1_0" cutoff="12"/>
+  <touch name="sensor_m1_m1" site="site_m1_m1" cutoff="12"/>
+
+  <!-- Column x = 0 (middle): top->bottom -->
+  <touch name="sensor_0_p1"  site="site_0_p1" cutoff="12"/>
+  <touch name="sensor_0_0"   site="site_0_0" cutoff="12"/>
+  <touch name="sensor_0_m1"  site="site_0_m1" cutoff="12"/>
+
+  <!-- Column x = +0.1 (right): top->bottom -->
+  <touch name="sensor_p1_p1" site="site_p1_p1" cutoff="12"/>
+  <touch name="sensor_p1_0"  site="site_p1_0" cutoff="12"/>
+  <touch name="sensor_p1_m1" site="site_p1_m1" cutoff="12"/>
+  </sensor>
+
+  <actuator>
+    <!-- Apply x-force as if acting at a point 0.5m above COM: generates matching torque around y -->
+    <general name="force_x" body="box_body" gear="1 0 0 0 0 0"/>
+    <general name="force_y" body="box_body" gear="0 1 0 0 0 0"/>
+  </actuator>
+</mujoco>
