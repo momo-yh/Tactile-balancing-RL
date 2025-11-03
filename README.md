@@ -1,4 +1,4 @@
-# Balancing Ball PPO Agent
+# Balancing PPO Agent
 
 This repository contains a MuJoCo-based balancing task where a neural policy learned with Proximal Policy Optimisation (PPO) keeps a box centred on top of a ball. Classical controllers have been replaced entirely by a continuous Gaussian actor; the agent learns from tactile feedback gathered at the base of the box.
 

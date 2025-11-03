@@ -16,7 +16,7 @@ HIDDEN_DIM = int(os.environ.get("HIDDEN_DIM", "64"))
 ACTION_FORCE_MAGNITUDE = float(os.environ.get("ACTION_FORCE_MAGNITUDE", "50.0"))
 
 # Startup perturbation settings
-PERTURB_FORCE_SCALE = float(os.environ.get("PERTURB_FORCE_SCALE", "70.0"))
+PERTURB_FORCE_SCALE = float(os.environ.get("PERTURB_FORCE_SCALE", "100.0"))
 PERTURB_APPLY_STEPS = int(os.environ.get("PERTURB_APPLY_STEPS", "1"))
 PERTURB_START_DELAY = int(os.environ.get("PERTURB_START_DELAY", "150"))
 PERTURB_RESAMPLE_EPISODES = int(os.environ.get("PERTURB_RESAMPLE_EPISODES", "1"))

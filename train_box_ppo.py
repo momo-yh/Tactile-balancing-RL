@@ -486,10 +486,10 @@ def main():
     # Use shared configuration from settings.py for these parameters
     # (STACK_SIZE, OBS_DIM, ACTION_DIM, etc.)
     # Local training-only parameters below:
-    MAX_TRAINING_STEPS = 500000
-    ROLLOUT_LENGTH = 1024
-    BATCH_SIZE = 32     # smaller minibatch to increase gradient variance
-    PPO_EPOCHS = 32     # more epochs per rollout to better exploit good rollouts
+    MAX_TRAINING_STEPS = 5000000
+    ROLLOUT_LENGTH = 512
+    BATCH_SIZE = 128     # smaller minibatch to increase gradient variance
+    PPO_EPOCHS = 16     # more epochs per rollout to better exploit good rollouts
     LR = 1e-4
     ENTROPY_COEF = 0.01
     LR_DECAY_FRACTION = float(os.environ.get("LR_DECAY_FRACTION", "0.75"))
@@ -591,7 +591,7 @@ def main():
     print("Starting PPO training...")
     # debug print removed for removed eccentric options
     while total_steps < MAX_TRAINING_STEPS:
-        episode_reward_sum = 0
+        episode_reward_sum = 0.0
 
         # initialize startup perturbation for the new episode: sample one random x push
         # but delay applying it until episode_step >= PERTURB_START_DELAY
@@ -609,11 +609,12 @@ def main():
         episode_step = 0
 
         bad_transition = False
-        for _ in range(ROLLOUT_LENGTH):
+        done = False
+
+        while (not done) and (total_steps < MAX_TRAINING_STEPS):
             allow_actions = episode_step >= ACTION_START_DELAY
 
             if allow_actions:
-                # Select continuous action from policy (in [-1,1])
                 action_out, log_prob, value = agent.select_action(state)
                 action_arr = np.atleast_1d(np.asarray(action_out).ravel()).astype(np.float32)
             else:
@@ -621,64 +622,49 @@ def main():
                 _, log_prob, _, value = agent.network.get_action_and_value(state, zero_action)
                 action_arr = zero_action
 
-            # already squashed by tanh in the policy; treat as unscaled action in [-1,1]
             action_unscaled = action_arr
             action_scaled = np.clip(action_unscaled, -1.0, 1.0) * ACTION_FORCE_MAGNITUDE
 
-            # apply action as an external spatial force on the box body (x only)
-            # clear global applied forces first (perturbation uses xfrc_applied)
             data.xfrc_applied[:] = 0
-            # xfrc_applied is a 6-vector: [fx, fy, fz, tx, ty, tz]
             Fx = np_scalar(action_scaled[0])
-            # write pure x force; explicitly zero torque components so that
-            # no unintended moments are applied unless we later add them.
             data.xfrc_applied[box_body_id][0] = Fx
             data.xfrc_applied[box_body_id][1] = 0.0
             data.xfrc_applied[box_body_id][2] = 0.0
             data.xfrc_applied[box_body_id][3] = 0.0
             data.xfrc_applied[box_body_id][4] = 0.0
             data.xfrc_applied[box_body_id][5] = 0.0
-            # Force applied at the COM (no extra torque around y-axis).
-            # check if we should start the delayed perturbation
+
             if (not perturb_started) and (episode_step >= PERTURB_START_DELAY):
                 active_perturb_steps_remaining = PERTURB_APPLY_STEPS
                 perturb_started = True
 
-            # apply the startup perturbation only during its active window
             if active_perturb_steps_remaining > 0:
-                # add (sum) the startup perturbation to the current applied force
                 data.xfrc_applied[box_body_id] = data.xfrc_applied[box_body_id] + active_perturb_force
                 active_perturb_steps_remaining -= 1
 
-            # Optional debug: print applied spatial force/torque for first few episodes
             if os.environ.get("DEBUG_EPISODES", "0") == "1" and episode_count < 5 and (episode_step % 50 == 0):
                 try:
                     print(f"[DEBUG] applied xfrc_applied (body={box_body_id}): {data.xfrc_applied[box_body_id]}")
                 except Exception:
                     pass
 
-            # Step simulation
             mujoco.mj_step(model, data)
             total_steps += 1
             episode_step += 1
-            # Periodic snapshot every N steps (save current model regardless of best)
+
             try:
-                PERIODIC_SAVE_STEPS = int(os.environ.get("PERIODIC_SAVE_STEPS", "50000"))
+                PERIODIC_SAVE_STEPS = int(os.environ.get("PERIODIC_SAVE_STEPS", "1000000"))
                 if PERIODIC_SAVE_STEPS > 0 and (total_steps % PERIODIC_SAVE_STEPS == 0):
-                    # Save a stamped snapshot and also update an unversioned 'last' file
                     last_model_name = f"box_ppo_model_last_{total_steps}.pt"
                     last_model_path = os.path.join(save_root, last_model_name)
                     torch.save(agent.network.state_dict(), last_model_path)
-                    # Update canonical last file (overwritten each periodic checkpoint)
                     shutil.copy(last_model_path, os.path.join(save_root, "box_ppo_model_last.pt"))
-                    # Mirror into latest/ for easy access
                     os.makedirs(latest_dir, exist_ok=True)
                     shutil.copy(last_model_path, os.path.join(latest_dir, last_model_name))
                     shutil.copy(os.path.join(save_root, "box_ppo_model_last.pt"), os.path.join(latest_dir, "box_ppo_model_last.pt"))
             except Exception as e:
                 print(f"Warning: periodic checkpoint failed at step {total_steps}: {e}")
-            
-            # Get observation and reward
+
             obs = get_observation(data)
             obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
             if obs_rms is not None:
@@ -688,6 +674,7 @@ def main():
                     print(f"[WARN] Non-finite normalized observation at step {total_steps}; resetting episode.")
                     state = reset_sim(model, data, state_stacker, obs_rms)
                     bad_transition = True
+                    done = True
                     break
             else:
                 obs_norm = obs
@@ -698,8 +685,9 @@ def main():
                 print(f"[WARN] Non-finite stacked state at step {total_steps}; resetting episode.")
                 state = reset_sim(model, data, state_stacker, obs_rms)
                 bad_transition = True
+                done = True
                 break
-            
+
             timeout = (episode_step >= MAX_EPISODE_STEPS)
             pos = np.asarray(data.body('box_body').xpos, dtype=np.float32)
             out_of_bounds = (abs(pos[0]) > BOUNDARY_LIMIT) or (abs(pos[1]) > BOUNDARY_LIMIT)
@@ -707,43 +695,40 @@ def main():
             reward, alive = compute_reward(data, Fx, TILT_LIMIT_RADIANS, out_of_bounds=out_of_bounds)
             done = (not alive) or timeout
 
-            # Optional debug printing to help diagnose immediate terminations.
-            # Set DEBUG_EPISODES=1 in the environment to enable a few prints.
             try:
                 if os.environ.get("DEBUG_EPISODES", "0") == "1" and episode_count < 5:
                     print(f"[DEBUG] ep={episode_count} step={episode_step} alive={alive} timeout={timeout} reward={reward:.3f}")
             except Exception:
                 pass
-            
+
             episode_reward_sum += reward
-            
-            # Store transition (store continuous squashed action in [-1,1])
+
             stored = agent.store_transition(state, action_unscaled, reward, float(done), log_prob, value)
 
-            # If buffer completed a rollout, perform an immediate update to
-            # compute advantages and train before continuing to collect more
-            # transitions. This avoids accidental extra stores overwriting the
-            # buffer when caller-side sequencing gets slightly off.
             if stored:
                 agent.update(state, float(done))
-            
+
             state = next_state
-            
+
+            if os.environ.get("DEBUG_EPISODE_PROGRESS", "0") == "1":
+                try:
+                    print(
+                        f"[EP {episode_count}] step={episode_step} reward_sum={episode_reward_sum:.2f} "
+                        f"done={done} alive={alive} timeout={timeout} out_of_bounds={out_of_bounds}"
+                    )
+                except Exception:
+                    pass
+
             if done:
                 episode_count += 1
                 episode_rewards.append(episode_reward_sum)
 
-                # use outer save_model_and_stats helper
-
-                # Save best model and observation normalization (mean, var, count) so validation uses same stats
                 try:
                     if episode_reward_sum > best_episode_reward:
                         best_episode_reward = episode_reward_sum
                         best_model_path, best_rms_path = save_model_and_stats("best", best=True)
-                        save_model_and_stats("last") # Also save a snapshot of the current (last) model
                         print(f"New best model saved ({save_root}) (episode {episode_count}) with reward {episode_reward_sum:.2f}")
 
-                        # Automatically run validation for the newly saved best model
                         try:
                             from validate_best import run_validation
 
@@ -782,14 +767,16 @@ def main():
                             print(f"Warning: automatic validation after best save failed: {val_err}")
                 except Exception as e:
                     print(f"Warning: failed to save best model or obs_rms: {e}")
+
                 if episode_count % 20 == 0:
                     print(f"Episode {episode_count} | Total Steps: {total_steps} | Reward: {episode_reward_sum:.2f}")
-                
+
                 state = reset_sim(model, data, state_stacker, obs_rms)
-                episode_reward_sum = 0
+                episode_reward_sum = 0.0
+                break
 
         if bad_transition:
-            episode_reward_sum = 0
+            episode_reward_sum = 0.0
             continue
 
 
@@ -820,7 +807,7 @@ def main():
     plt.xlabel("Episode")
     plt.ylabel("Total Reward")
     plt.savefig(os.path.join(save_root, "box_ppo_rewards.png"))
-    plt.show()
+    print(f"Saved reward plot to {os.path.join(save_root, 'box_ppo_rewards.png')}")
 
     # --- Evaluation ---
     print("Starting evaluation...")

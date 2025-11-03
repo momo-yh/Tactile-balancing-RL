@@ -31,6 +31,7 @@ def run_validation(
     max_steps=1000,
     save_dir=None,
     file_prefix=None,
+    force_given=None,
 ):
     model = mujoco.MjModel.from_xml_path("model.xml")
     data = mujoco.MjData(model)
@@ -193,8 +194,10 @@ def run_validation(
 
         if ep % PERTURB_RESAMPLE_EPISODES == 0:
             last_perturb_force = np.zeros(6, dtype=np.float32)
-            Fx_pf = np.random.uniform(-PERTURB_FORCE_SCALE, PERTURB_FORCE_SCALE)
-            Fx_pf = 100  ##TODO
+            if force_given is None:
+                Fx_pf = np.random.uniform(-PERTURB_FORCE_SCALE, PERTURB_FORCE_SCALE)
+            else:
+                Fx_pf = force_given
             last_perturb_force[0] = Fx_pf
             last_perturb_force[3:] = 0.0
 
@@ -272,6 +275,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps', type=int, default=1000)
     parser.add_argument('--save_dir', type=str, default=None, help='Optional directory to store validation artifacts')
     parser.add_argument('--file_prefix', type=str, default=None, help='Optional filename prefix for saved plots')
+    parser.add_argument('--force_given', type=float, default=None, help='Optional force value to apply')
     args = parser.parse_args()
 
     rewards, paths = run_validation(
@@ -282,5 +286,6 @@ if __name__ == '__main__':
         max_steps=args.max_steps,
         save_dir=args.save_dir,
         file_prefix=args.file_prefix,
+        force_given=args.force_given,
     )
     print(f"Saved plots: {paths}")
