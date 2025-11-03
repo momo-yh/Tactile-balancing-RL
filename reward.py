@@ -4,11 +4,11 @@ import numpy as np
 from features import compute_tilt_angle, compute_tilt_rate, build_observation
 
 # Default reward coefficients (can be overridden via environment variables)
-ALIVE_BONUS = float(os.environ.get("ALIVE_BONUS", "10.0"))
-FALL_PENALTY = float(os.environ.get("FALL_PENALTY", "100.0"))
+ALIVE_BONUS = float(os.environ.get("ALIVE_BONUS", "1.0"))
+FALL_PENALTY = float(os.environ.get("FALL_PENALTY", "10.0"))
 ANGULAR_VEL_PENALTY = float(os.environ.get("ANGULAR_VEL_PENALTY", "0.1"))
 ACTION_ENERGY_PENALTY = float(os.environ.get("ACTION_ENERGY_PENALTY", "0.05"))
-SENSOR_MATCH_BONUS = float(os.environ.get("SENSOR_MATCH_BONUS", "10"))
+SENSOR_MATCH_BONUS = float(os.environ.get("SENSOR_MATCH_BONUS", "1"))
 SENSOR_MATCH_TOLERANCE = float(os.environ.get("SENSOR_MATCH_TOLERANCE", "0.2"))
 SENSOR_CONTACT_TOLERANCE = float(os.environ.get("SENSOR_CONTACT_TOLERANCE", "0.1"))
 
