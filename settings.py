@@ -18,10 +18,11 @@ ACTION_FORCE_MAGNITUDE = float(os.environ.get("ACTION_FORCE_MAGNITUDE", "50.0"))
 # Startup perturbation settings
 PERTURB_FORCE_SCALE = float(os.environ.get("PERTURB_FORCE_SCALE", "200.0"))
 PERTURB_APPLY_STEPS = int(os.environ.get("PERTURB_APPLY_STEPS", "1"))
-PERTURB_START_DELAY = int(os.environ.get("PERTURB_START_DELAY", "150"))
+PERTURB_START_DELAY = int(os.environ.get("PERTURB_START_DELAY", "200"))
 PERTURB_RESAMPLE_EPISODES = int(os.environ.get("PERTURB_RESAMPLE_EPISODES", "1"))
 
-ACTION_START_DELAY = int(os.environ.get("ACTION_START_DELAY", str(PERTURB_START_DELAY)))
+# ACTION_START_DELAY = int(os.environ.get("ACTION_START_DELAY", str(PERTURB_START_DELAY)))
+ACTION_START_DELAY = int(os.environ.get("ACTION_START_DELAY", "150"))
 
 # Tilt-based termination threshold (degrees and radians)
 TILT_LIMIT_DEGREES = float(os.environ.get("TILT_LIMIT_DEGREES", "15.0"))

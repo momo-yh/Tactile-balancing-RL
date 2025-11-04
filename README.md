@@ -128,6 +128,22 @@ Compare controller vs open‑loop:
 python validate_compare.py --model pretrained/latest/box_ppo_model_best.pt --episodes 3
 ```
 
+Random continuous perturbation validation (robustness test):
+
+```bash
+python validate_random_perturb.py \
+	--model pretrained/latest/box_ppo_model_best.pt \
+	--obs_rms pretrained/latest/obs_rms_best.npz \
+	--episodes 1 \
+	--max_steps 1500 \
+	--noise_type gaussian \
+	--noise_scale 5.0
+```
+
+Notes:
+- `--noise_type` can be `gaussian`, `uniform`, or `ou` (Ornstein–Uhlenbeck). Use `--ou_theta/--ou_mu` to tune OU.
+- The random force is added to the agent’s x‑force each step (continuous disturbance), then applied via `data.xfrc_applied[box_body_id][0]`.
+
 Notes:
 - `validate_best.py` supports `--max_steps`, `--render`, and `--force_given` (to fix the startup perturbation force), which can help produce controlled, repeatable plots.
 - At the end of training, the script launches a passive MuJoCo viewer for a quick smoke evaluation. In headless environments, the viewer import will fail gracefully and evaluation will continue without rendering.
