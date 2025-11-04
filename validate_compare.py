@@ -8,7 +8,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime
 import argparse, importlib
-from train_box_ppo import ActorCritic, StateStacker, RunningMeanStd, get_observation
+from train_ppo_mjx import ActorCritic, StateStacker, RunningMeanStd, get_observation
 from features import tactile_sensors, SENSOR_NAMES
 
 # Device selection (reuse same logic as training file)

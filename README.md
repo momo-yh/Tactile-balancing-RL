@@ -21,65 +21,147 @@ This repository contains a MuJoCo-based balancing task where a neural policy lea
 Episodes terminate immediately on failure or after the configured step horizon (`MAX_EPISODE_STEPS`).
 
 ## Training pipeline
+# Balancing PPO Agent — Environment and Training Guide
 
-```cmd
+This document explains the RL setup end to end: observation/action shapes, reward design, training loop and hyperparameters, runtime commands, common environment variables, how to inspect actual minibatches, and practical debugging tips.
+
+## 1) Overview
+
+- Task: learn a continuous control policy that keeps a box balanced on a ball in MuJoCo.
+- Algorithm: standard on‑policy PPO with a shared Actor‑Critic network; the actor samples from a Gaussian and squashes with tanh to [-1, 1].
+- Execution: single‑environment training loop (rollouts collected step‑by‑step in one simulator instance).
+
+## 2) Requirements
+
+- Python 3.11+
+- MuJoCo Python bindings (with MuJoCo runtime/assets properly installed)
+- PyTorch (CUDA recommended)
+- NumPy, Matplotlib
+
+## 3) Key files
+
+- `train_box_ppo.py`: main training script (single environment PPO).
+- `reward.py`: reward function and shaping constants (`ALIVE_BONUS`, `FALL_PENALTY`, `ACTION_ENERGY_PENALTY`, etc.).
+- `settings.py`: shared dimensions and defaults (`STACK_SIZE`, `OBS_DIM`, `ACTION_DIM`, …).
+- `validate_best.py` and `validate_compare.py`: evaluation scripts for deterministic rollout and controller vs open‑loop comparison.
+
+## 4) Observations and actions
+
+- `STACK_SIZE`: 8 by default (frames to stack).
+- `OBS_DIM`: 3 by default (three middle‑row tactile sensors).
+- `STATE_DIM = OBS_DIM × STACK_SIZE`: 24 by default (3 × 8).
+- `ACTION_DIM`: 1 (apply force along world x). The network outputs in [-1, 1], then the force applied in MuJoCo is `action × ACTION_FORCE_MAGNITUDE` (default 50.0).
+
+The `StateStacker` appends the latest observation each step so the network receives a flattened state of shape `(STATE_DIM,)`.
+
+## 5) Reward shaping (high‑level)
+
+- Alive bonus (`ALIVE_BONUS`) when contact and tilt are within limits.
+- Angular velocity penalty (`ANGULAR_VEL_PENALTY` × tilt_rate²) to suppress oscillations.
+- Action energy penalty (`ACTION_ENERGY_PENALTY` × force²) to discourage excessive forces.
+- Sensor agreement bonus (`SENSOR_MATCH_BONUS`) when the three tactile sensors agree, governed by `SENSOR_MATCH_TOLERANCE`.
+- Failure penalty (`FALL_PENALTY`) when the tilt or position leaves the safe region.
+
+See `reward.py` for exact constants and defaults.
+
+## 6) Training hyperparameters (defaults in the script)
+
+- `MAX_TRAINING_STEPS`: 5_000_000 total steps
+- `ROLLOUT_LENGTH`: 512 steps per PPO update (256 when `SHORT_TEST=1`)
+- `BATCH_SIZE`: 128 (minibatch size)
+- `PPO_EPOCHS`: 16 (epochs per rollout)
+- `LR`: 1e‑4 (initial learning rate)
+- `ENTROPY_COEF`: 0.01
+- `MAX_EPISODE_STEPS`: 2000 (time limit per episode)
+
+PPO update sample count per update (single env): `ROLLOUT_LENGTH`. With defaults: 512 samples → 512/128 = 4 minibatches per update.
+
+The training loop also uses delayed action start (`ACTION_START_DELAY`) and startup perturbations (`PERTURB_*`) to test robustness.
+
+## 7) Environment variables
+
+- `SHORT_TEST=1`: quick smoke test (shrinks `MAX_TRAINING_STEPS` and `ROLLOUT_LENGTH`).
+- `USE_OBS_NORMALIZATION=1`: enable online observation normalization via `RunningMeanStd`.
+- `LR_DECAY_FRACTION`: when to trigger LR decay (default 0.75 of expected updates).
+- `LR_DECAY_GAMMA`: multiplicative LR drop (default 0.1; use 1.0 to disable).
+- `PERIODIC_SAVE_STEPS`: step interval for periodic “last” checkpoints (default set in code).
+
+## 8) Learning‑rate scheduling
+
+`train_box_ppo.py` enables a late‑stage LR decay via `torch.optim.lr_scheduler.MultiStepLR`.
+
+- The script estimates the total number of PPO updates (`MAX_TRAINING_STEPS // ROLLOUT_LENGTH`), places one milestone at `LR_DECAY_FRACTION`, then applies `LR_DECAY_GAMMA`.
+- Example: `1e‑4 → 1e‑5` at ~75% of the run with defaults.
+
+## 9) How to run
+
+Train:
+
+```bash
 python train_box_ppo.py
-python train_box_ppo.py --resume-dir <folder> --resume-tag {best,last}
 ```
 
-Default hyper-parameters (adjustable through environment variables and `settings.py`):
+Short smoke test:
 
-- `ROLLOUT_LENGTH=1024`, `BATCH_SIZE=32`, `PPO_EPOCHS=32`, `LR=1e-4`.
-- Startup perturbations (`PERTURB_*`) periodically nudge the system to test robustness.
-- Observation statistics and checkpoints are written to `pretrained/<timestamp>_TILTXX_RL/`, with `pretrained/latest/` mirroring the newest artefacts.
+```bash
+SHORT_TEST=1 python train_box_ppo.py
+```
 
-### Learning-rate scheduling
+Resume from a previous run:
 
-`train_box_ppo.py` now supports late-stage learning-rate decay via `torch.optim.lr_scheduler.MultiStepLR`:
+```bash
+python train_box_ppo.py --resume-dir pretrained/<your-run> --resume-tag best
+```
 
-| Environment variable | Default | Effect |
-|----------------------|---------|--------|
-| `LR_DECAY_FRACTION`  | `0.75`  | Fraction of expected PPO updates completed before the first decay. |
-| `LR_DECAY_GAMMA`     | `0.1`   | Multiplicative drop applied to the optimiser’s LR (set `1.0` to disable). |
+Evaluate the best checkpoint (deterministic replay):
 
-The trainer estimates the total number of PPO updates (`MAX_TRAINING_STEPS // ROLLOUT_LENGTH`), schedules a single decay milestone, and logs the drop when it fires. This lets the policy take smaller “refinement” steps near convergence (e.g. `1e-4 → 1e-5`).
-
-## Evaluation & analysis
-
-### Deterministic rollouts
-
-```cmd
+```bash
 python validate_best.py \
 	--model pretrained/latest/box_ppo_model_best.pt \
 	--obs_rms pretrained/latest/obs_rms_best.npz \
 	--episodes 5
 ```
 
-`validate_best.py` replays the policy deterministically, logs per-step rewards/actions, and can optionally render (`--render`) if a MuJoCo viewer is available. Validation artefacts are stored under `validation/<timestamp>/`.
+Compare controller vs open‑loop:
 
-### Controlled vs open-loop comparison
-
-```cmd
+```bash
 python validate_compare.py --model pretrained/latest/box_ppo_model_best.pt --episodes 3
 ```
 
-For each episode, `validate_compare.py` clones the initial MuJoCo state and runs the simulation twice: once with the learned controller, once with zero actions. It plots bottom-row tactile forces in a two-tier figure so you can inspect how the controller stabilises contact pressure relative to the passive baseline. Average rewards for both modes are reported at the end of the run.
+Notes:
+- `validate_best.py` supports `--max_steps`, `--render`, and `--force_given` (to fix the startup perturbation force), which can help produce controlled, repeatable plots.
+- At the end of training, the script launches a passive MuJoCo viewer for a quick smoke evaluation. In headless environments, the viewer import will fail gracefully and evaluation will continue without rendering.
 
-### Additional utilities
+## 10) What’s inside a minibatch
 
-- `test_force_sensors.py` fires diagnostic impulses to characterise tactile responses.
+During PPO updates, data come from a single‑env rollout of length `ROLLOUT_LENGTH`, shuffled and split into minibatches:
 
+- `obs_b`: `(batch_size, STATE_DIM)` float32; observations are sanitized (`nan/inf → finite`) and optionally normalized.
+- `actions_b`: `(batch_size, ACTION_DIM)` float32 in [-1, 1] (network outputs); the environment applies `× ACTION_FORCE_MAGNITUDE`.
+- `b_old_log_probs`, `b_advantages`, `b_returns`: `(batch_size,)` float32.
 
-## Requirements
+With defaults: 512 samples per update, batch size 128 → 4 minibatches.
 
-- Python 3.11+
-- MuJoCo 3.x Python bindings (with a valid MuJoCo installation and assets)
-- PyTorch (CUDA optional but recommended)
-- NumPy, Matplotlib
+To peek at real data, you can either:
 
+1) Temporarily print in the training loop near `stored = agent.store_transition(...)` (lightweight).
+2) Write a tiny script to create a `PPOAgent`, push a few fake transitions into `RolloutBuffer`, then call `get_minibatches(batch_size)` and print the first batch.
 
-## Tips
+I can provide either on request.
 
-- Enable observation normalisation with `USE_OBS_NORMALIZATION=1` for better training stability.
-- Use `SHORT_TEST=1` to run a quick 20k-step smoke training pass before committing to a full session.
-- Check `pretrained/latest/` for the most recent `box_ppo_model_{best,last}.pt` weights and matching `obs_rms_*.npz` files before launching a validation job.
+## 11) Debugging tips
+
+- If learning stalls, revisit `LR` and `ROLLOUT_LENGTH` first. Batch size and epochs also change the optimization dynamics.
+- If non‑finite values appear (NaN/inf), the script will warn and skip polluted minibatches. Check whether the culprit is `obs`, `actions`, or network outputs.
+- PPO update cadence: `agent.store_transition(...)` returns `True` every `ROLLOUT_LENGTH` steps, which triggers `agent.update(...)`.
+- When using observation normalization, make sure you load the matching `obs_rms_*.npz` when resuming or evaluating to keep distributions consistent.
+
+## 12) Repro and artifacts
+
+- Artifacts are saved under `pretrained/<timestamp>_TILTXX_RL/`, and mirrored to `pretrained/latest/` for convenience.
+- A simple reward curve (`box_ppo_rewards.png`) is written at the end of training.
+- To compare runs, keep `ROLLOUT_LENGTH`, `LR`, `USE_OBS_NORMALIZATION`, and perturbation settings the same.
+
+---
+
+Need a ready‑to‑run inspection script or temporary prints added to `train_box_ppo.py` to show a real minibatch? Tell me which you prefer and I’ll add it.

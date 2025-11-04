@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from datetime import datetime
 import argparse, importlib
-from train_box_ppo import ActorCritic, StateStacker, RunningMeanStd, get_observation, np_scalar
+from train_ppo_mjx import ActorCritic, StateStacker, RunningMeanStd, get_observation, np_scalar
 
 # Device selection (reuse same logic as training file)
 from reward import compute_reward
