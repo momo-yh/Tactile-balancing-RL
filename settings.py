@@ -4,7 +4,7 @@ import os
 # Shared environment-configurable parameters used by training and validation
 
 # Observation / stacking
-STACK_SIZE = int(os.environ.get("STACK_SIZE", "32"))
+STACK_SIZE = int(os.environ.get("STACK_SIZE", "16"))
 OBS_DIM = int(os.environ.get("OBS_DIM", "2"))
 STATE_DIM = OBS_DIM * STACK_SIZE
 
@@ -37,7 +37,7 @@ USE_OBS_NORMALIZATION = os.environ.get("USE_OBS_NORMALIZATION", "0") == "1"
 # Format: list of (min_force, max_force) tuples applied sequentially across stages.
 # You can override via environment variable PERTURB_CURRICULUM_RANGES using
 # semicolon-separated "min-max" entries, e.g. "0-50;50-100;100-200;200-500".
-_default_curriculum = [(0.0, 200.0)]
+_default_curriculum = [(0.0, 300.0)]
 _env_curriculum = os.environ.get("PERTURB_CURRICULUM_RANGES")
 if _env_curriculum:
     parsed = []
