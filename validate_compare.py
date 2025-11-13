@@ -272,7 +272,7 @@ if __name__ == '__main__':
     parser.add_argument('--obs_rms', type=str, default='pretrained/latest/obs_rms_best.npz', help='Path to obs_rms .npz file')
     parser.add_argument('--episodes', type=int, default=1)
     parser.add_argument('--render', action='store_true')
-    parser.add_argument('--max_steps', type=int, default=1000)
+    parser.add_argument('--max_steps', type=int, default=2000)
     parser.add_argument('--save_dir', type=str, default=None, help='Optional directory to store validation artifacts')
     parser.add_argument('--file_prefix', type=str, default=None, help='Optional filename prefix for saved plots')
     parser.add_argument('--force_given', type=float, default=None, help='Optional force value to apply')

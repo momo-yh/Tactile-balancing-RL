@@ -14,7 +14,7 @@ This repository contains a MuJoCo-based balancing task where a neural policy lea
 ### Reward shaping (`reward.py`)
 
 - **Alive bonus**: `ALIVE_BONUS` (default `+10`) is granted only when all three tactile sensors report contact (`|sensor| > SENSOR_CONTACT_TOLERANCE`) and the tilt stays below `±TILT_LIMIT_DEGREES`.
-- **Smoothness penalties**: `-ANGULAR_VEL_PENALTY * tilt_rate²` discourages oscillations, while `-ACTION_ENERGY_PENALTY * force²` suppresses violent pushes.
+- **Smoothness penalties**: Legacy angular-velocity and action-energy penalties have been removed from the current reward to simplify tuning.
 - **Sensor agreement bonus**: When the three sensors agree, a graded bonus up to `SENSOR_MATCH_BONUS` (default `10`) is added. The bonus scales linearly with the spread (`max(sensor) - min(sensor)`); perfect agreement (`spread = 0`) yields the full reward, and the contribution tapers to zero once the spread exceeds `SENSOR_MATCH_TOLERANCE`.
 - **Failure penalty**: `-FALL_PENALTY` (default `-100`) triggers when the tilt or position exits the safe region.
 
@@ -41,133 +41,117 @@ This document explains the RL setup end to end: observation/action shapes, rewar
 ## 3) Key files
 
 - `train_box_ppo.py`: main training script (single environment PPO).
-- `reward.py`: reward function and shaping constants (`ALIVE_BONUS`, `FALL_PENALTY`, `ACTION_ENERGY_PENALTY`, etc.).
+- `reward.py`: reward function and shaping constants (`ALIVE_BONUS`, `FALL_PENALTY`, `SENSOR_MATCH_BONUS`, etc.).
 - `settings.py`: shared dimensions and defaults (`STACK_SIZE`, `OBS_DIM`, `ACTION_DIM`, …).
 - `validate_best.py` and `validate_compare.py`: evaluation scripts for deterministic rollout and controller vs open‑loop comparison.
 
 ## 4) Observations and actions
- # Balancing PPO Agent
 
-This repository implements a MuJoCo balancing task where a learned PPO policy applies continuous forces to keep a box balanced on a ball. The agent relies on tactile sensors (three middle-row sensors) and learns a continuous Gaussian policy (actor) with a value head (critic).
+- `STACK_SIZE`: 8 by default (frames to stack).
+- `OBS_DIM`: 3 by default (three middle‑row tactile sensors).
+- `STATE_DIM = OBS_DIM × STACK_SIZE`: 24 by default (3 × 8).
+- `ACTION_DIM`: 1 (apply force along world x). The network outputs in [-1, 1], then the force applied in MuJoCo is `action × ACTION_FORCE_MAGNITUDE` (default 50.0).
 
-This README was updated to reflect recent enhancements in the training scripts: curriculum-based startup perturbations, automatic validation hooks, and improved resume provenance (see "Recent changes" below).
+The `StateStacker` appends the latest observation each step so the network receives a flattened state of shape `(STATE_DIM,)`.
 
-## Quick summary
+## 5) Reward shaping (high‑level)
 
-- Training scripts: `train_box_ppo.py` (classic single-env PPO) and `train_ppo_mjx.py` (more feature-rich MJX trainer with curriculum support and automatic validation).
-- New features: curriculum of perturbation strengths (`PERTURB_CURRICULUM_RANGES`), recording of resume provenance (`resume_info.json` + copies in `save_root/resume_files`), and automatic validation runs when saving snapshots (best/stage).
-- Reward defaults changed: notable sensor-related defaults were adjusted (see "Reward notes"). Always consult `reward.py` for exact defaults and environment variable overrides.
+- Alive bonus (`ALIVE_BONUS`) when contact and tilt are within limits.
+- Angular velocity penalty (`ANGULAR_VEL_PENALTY` × tilt_rate²) to suppress oscillations.
+- Action energy penalty (`ACTION_ENERGY_PENALTY` × force²) to discourage excessive forces.
+- Sensor agreement bonus (`SENSOR_MATCH_BONUS`) when the three tactile sensors agree, governed by `SENSOR_MATCH_TOLERANCE`.
+- Failure penalty (`FALL_PENALTY`) when the tilt or position leaves the safe region.
 
-## System overview
+See `reward.py` for exact constants and defaults.
 
-- Observations: three tactile sensors (`sensor_p1_0`, `sensor_0_0`, `sensor_m1_0`) are stacked across `STACK_SIZE` frames. Optionally normalized by `RunningMeanStd` when `USE_OBS_NORMALIZATION=1`.
-- Policy/value: shared ActorCritic MLPs (tanh activations). The actor outputs mean actions and keeps a learnable `log_std`; samples are squashed with `tanh` into [-1, 1].
-- Action: a single continuous force along the world x-axis. The environment applies `action × ACTION_FORCE_MAGNITUDE`.
-- Rollouts: on‑policy rollouts are collected, GAE is used for advantage estimates, and PPO performs minibatch updates.
+## 6) Training hyperparameters (defaults in the script)
 
-## Recent changes (what to document)
+- `MAX_TRAINING_STEPS`: 5_000_000 total steps
+- `ROLLOUT_LENGTH`: 512 steps per PPO update (256 when `SHORT_TEST=1`)
+- `BATCH_SIZE`: 128 (minibatch size)
+- `PPO_EPOCHS`: 16 (epochs per rollout)
+- `LR`: 1e‑4 (initial learning rate)
+- `ENTROPY_COEF`: 0.01
+- `MAX_EPISODE_STEPS`: 2000 (time limit per episode)
 
-1. Curriculum-based perturbations
-	- `train_ppo_mjx.py` supports a perturbation curriculum via `PERTURB_CURRICULUM_RANGES` (list of `(min-max)` segments). The trainer samples startup perturbation magnitudes from the current stage range and can advance stages every `CURRICULUM_STAGE_EPISODES` episodes.
-	- Example via environment variable:
+PPO update sample count per update (single env): `ROLLOUT_LENGTH`. With defaults: 512 samples → 512/128 = 4 minibatches per update.
 
-	  PERTURB_CURRICULUM_RANGES="0-200;100-200;200-300;300-500"
+The training loop also uses delayed action start (`ACTION_START_DELAY`) and startup perturbations (`PERTURB_*`) to test robustness.
 
-	  Each `min-max` pair is a stage. The trainer parses this string and uses it instead of code defaults.
+## 7) Environment variables
 
-2. Resume provenance and snapshot metadata
-	- When resuming from an existing run, `train_ppo_mjx.py` copies the resumed model/obs_rms into `save_root/resume_files/` and writes `resume_info.json` with timestamp, command args, and a snapshot of uppercase settings.
+- `SHORT_TEST=1`: quick smoke test (shrinks `MAX_TRAINING_STEPS` and `ROLLOUT_LENGTH`).
+- `USE_OBS_NORMALIZATION=1`: enable online observation normalization via `RunningMeanStd`.
+- `LR_DECAY_FRACTION`: when to trigger LR decay (default 0.75 of expected updates).
+- `LR_DECAY_GAMMA`: multiplicative LR drop (default 0.1; use 1.0 to disable).
+- `PERIODIC_SAVE_STEPS`: step interval for periodic “last” checkpoints (default set in code).
 
-3. Automatic validation hooks
-	- The trainer runs automatic validation when a new best model is saved and when a curriculum stage completes. Validation outputs are saved under `save_root/validation/` and include reward plots. This replaces the earlier ad-hoc validation block with a reusable `run_validation_pass` flow.
+## 8) Learning‑rate scheduling
 
-4. Reward parameter changes
-	- Sensor-related defaults were adjusted in `reward.py` (example: `SENSOR_MATCH_BONUS` increased, tolerances changed). See `reward.py` for the exact values and environment variable overrides (you can override any constant using an environment variable with the same name).
+`train_box_ppo.py` enables a late‑stage LR decay via `torch.optim.lr_scheduler.MultiStepLR`.
 
-## Reward notes
+- The script estimates the total number of PPO updates (`MAX_TRAINING_STEPS // ROLLOUT_LENGTH`), places one milestone at `LR_DECAY_FRACTION`, then applies `LR_DECAY_GAMMA`.
+- Example: `1e‑4 → 1e‑5` at ~75% of the run with defaults.
 
-- Reward constants live in `reward.py`. Defaults can be overridden by environment variables. Notable parameters you might want to tune:
-  - `ALIVE_BONUS` — granted while the agent is 'alive' (contact + tilt limits).
-  - `FALL_PENALTY` — large negative reward on failure.
-  - `SENSOR_MATCH_BONUS`, `SENSOR_MATCH_TOLERANCE`, `SENSOR_CONTACT_TOLERANCE` — govern the sensor-agreement bonus.
+## 9) How to run
 
-Always check `reward.py` for the current defaults; recent commits changed sensor defaults (e.g. `SENSOR_MATCH_BONUS` and `SENSOR_MATCH_TOLERANCE`).
+Train:
 
-## Curriculum / perturbation configuration
-
-- Environment variable: `PERTURB_CURRICULUM_RANGES`. Format: semicolon-separated `min-max` ranges, e.g. `0-200;200-400;400-700`.
-- If unset, `train_ppo_mjx.py` uses a built-in default list.
-- `CURRICULUM_STAGE_EPISODES` controls how many completed episodes are required before the trainer considers advancing to the next stage (default present in `settings.py`).
-
-## Resuming and provenance
-
-- Resume: `python train_ppo_mjx.py --resume-dir pretrained/<run> --resume-tag best`.
-- When resuming, the trainer copies the resume model and obs-rms into your new `save_root/resume_files/` and writes `resume_info.json` (timestamp, selected settings snapshot, cmd args). This helps reproduce experiments later.
-
-## Validation and saved outputs
-
-- Validation results (plots and numeric rewards) are written into `<save_root>/validation/` by the automatic validator.
-- When a new best model or a stage snapshot is saved, the trainer optionally runs the validation flow and saves metrics and plots next to checkpoints.
-
-## How to run
-
-Train (classic):
-
-```cmd
+```bash
 python train_box_ppo.py
-```
-
-Train (MJX trainer, with more features including curriculum and resume):
-
-```cmd
-python train_ppo_mjx.py [--resume-dir <path>] [--resume-tag best|last|snapshot]
 ```
 
 Short smoke test:
 
-```cmd
-set SHORT_TEST=1
-python train_ppo_mjx.py
+```bash
+SHORT_TEST=1 python train_box_ppo.py
 ```
 
-Set a curriculum via environment variable (Windows cmd example):
+Resume from a previous run:
 
-```cmd
-set PERTURB_CURRICULUM_RANGES=0-200;100-200;200-300;300-500
-python train_ppo_mjx.py
+```bash
+python train_box_ppo.py --resume-dir pretrained/<your-run> --resume-tag best
 ```
 
-Evaluate best checkpoint (example):
+Evaluate the best checkpoint (deterministic replay):
 
-```cmd
-python validate_best.py --model pretrained/latest/box_ppo_model_best.pt --obs_rms pretrained/latest/obs_rms_best.npz --episodes 5
+```bash
+python validate_best.py \
+	--model pretrained/latest/box_ppo_model_best.pt \
+	--obs_rms pretrained/latest/obs_rms_best.npz \
+	--episodes 5
 ```
 
-## Key files
+Compare controller vs open‑loop:
 
-- `train_ppo_mjx.py` — main MJX trainer (curriculum, resume provenance, automatic validation).
-- `train_box_ppo.py` — simpler single‑env trainer.
-- `reward.py` — reward shaping constants (can be overridden with env vars).
-- `settings.py` — shared defaults and derived dimensions; now includes curriculum parsing support.
-- `validate_best.py`, `validate_compare.py`, `validate_random_perturb.py` — evaluation scripts.
+```bash
+python validate_compare.py --model pretrained/latest/box_ppo_model_best.pt --episodes 3
+```
 
-## Where to look in the code
+Random continuous perturbation validation (robustness test):
 
-- Curriculum parsing and defaults: `settings.py` (look for `PERTURB_CURRICULUM_RANGES` and `CURRICULUM_STAGE_EPISODES`).
-- Startup perturb sampling and curriculum advancement: `train_ppo_mjx.py` (`_sample_startup_perturbation`, `maybe_advance_curriculum`).
-- Resume provenance and `resume_info.json`: `train_ppo_mjx.py` (resume handling section).
-- Reward defaults and env overrides: `reward.py`.
+```bash
+python validate_random_perturb.py \
+	--model pretrained/latest/box_ppo_model_best.pt \
+	--obs_rms pretrained/latest/obs_rms_best.npz \
+	--episodes 1 \
+	--max_steps 1500 \
+	--noise_type gaussian \
+	--noise_scale 5.0
+```
 
-## Notes & tips
+Notes:
+- `--noise_type` can be `gaussian`, `uniform`, or `ou` (Ornstein–Uhlenbeck). Use `--ou_theta/--ou_mu` to tune OU.
+- The random force is added to the agent’s x‑force each step (continuous disturbance), then applied via `data.xfrc_applied[box_body_id][0]`.
 
-- When experimenting with curriculum ranges, pick overlapping ranges to smoothly increase disturbance magnitude.
-- Use `--resume-tag` to resume either the `best` or `last` snapshot; the trainer will copy resumed artifacts into your new run folder for traceability.
+Notes:
+- `validate_best.py` supports `--max_steps`, `--render`, and `--force_given` (to fix the startup perturbation force), which can help produce controlled, repeatable plots.
+- At the end of training, the script launches a passive MuJoCo viewer for a quick smoke evaluation. In headless environments, the viewer import will fail gracefully and evaluation will continue without rendering.
 
----
+## 10) What’s inside a minibatch
 
-If you'd like, I can:
+During PPO updates, data come from a single‑env rollout of length `ROLLOUT_LENGTH`, shuffled and split into minibatches:
 
-- Apply a small example `PERTURB_CURRICULUM_RANGES` to the README that mirrors your current config, or
-- Add a short examples/ directory with a minimal run script demonstrating setting environment vars on Windows.
-
-Changes applied: update README to add curriculum, resume and validation notes and correct reward/config references.
+- `obs_b`: `(batch_size, STATE_DIM)` float32; observations are sanitized (`nan/inf → finite`) and optionally normalized.
+- `actions_b`: `(batch_size, ACTION_DIM)` float32 in [-1, 1] (network outputs); the environment applies `× ACTION_FORCE_MAGNITUDE`.
+- `b_old_log_probs`, `b_advantages`, `b_returns`: `(batch_size,)` float32.

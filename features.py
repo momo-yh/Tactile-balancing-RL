@@ -6,6 +6,9 @@ SENSOR_NAMES = [
     'sensor_p1_m1', 'sensor_0_m1', 'sensor_m1_m1',
 ]
 
+MID_ROW_INDICES = (3, 4, 5)
+ANGULAR_VEL_DIRECTION_THRESHOLD = 0.01
+
 
 def _box_body(data):
     return data.body('box_body')
@@ -28,6 +31,23 @@ def tactile_sensors(data):
     return np.asarray(readings, dtype=np.float32)
 
 
+def mid_row_sensors(data):
+    """Return the three middle-row tactile readings (positive x, center, negative x)."""
+    sensors = tactile_sensors(data)
+    try:
+        return sensors[list(MID_ROW_INDICES)].astype(np.float32)
+    except Exception:
+        return np.zeros(3, dtype=np.float32)
+
+
+def _quantize_direction(value, threshold=ANGULAR_VEL_DIRECTION_THRESHOLD):
+    if value > threshold:
+        return 1.0
+    if value < -threshold:
+        return -1.0
+    return 0.0
+
+
 def compute_tilt_angle(data):
     """Signed tilt (radians) around the world y-axis."""
     try:
@@ -45,30 +65,18 @@ def compute_tilt_angle(data):
 def compute_tilt_rate(data):
     """Angular velocity (radians/s) around the y-axis."""
     try:
-        spatial_vel = _box_body(data).xvel
-        if spatial_vel.size >= 5:
-            return float(spatial_vel[4])
+        spatial_vel = _box_body(data).cvel
+        if spatial_vel.size >= 2:
+            return float(spatial_vel[1])
     except Exception:
         pass
     return 0.0
 
 
-def compute_position_velocity(data):
-    """Return (x_position, x_velocity) in world coordinates."""
-    try:
-        x_pos = float(_box_body(data).xpos[0])
-    except Exception:
-        x_pos = 0.0
-    try:
-        spatial_vel = _box_body(data).xvel
-        x_vel = float(spatial_vel[0]) if spatial_vel.size >= 1 else 0.0
-    except Exception:
-        x_vel = 0.0
-    return x_pos, x_vel
-
-
 def build_observation(data):
-    """Observation vector consisting only of the middle-row tactile sensors."""
-    sensors = tactile_sensors(data)
-    middle_row = sensors[3:6].astype(np.float32)
-    return middle_row
+    """Observation vector with tilt proxy and angular velocity direction sign."""
+    middle_row = mid_row_sensors(data)
+    tilt_proxy = float(middle_row[0] - middle_row[2])
+    angular_vel = compute_tilt_rate(data)
+    vel_direction = _quantize_direction(angular_vel)
+    return np.asarray([tilt_proxy, vel_direction], dtype=np.float32)

@@ -3,7 +3,6 @@ import mujoco
 import mujoco.mjx
 import jax
 import jax.numpy as jnp
-from functools import partial
 import xml.etree.ElementTree as ET
 import numpy as np
 import time
@@ -19,23 +18,28 @@ from collections import deque
 import matplotlib.pyplot as plt
 import os
 import sys
+import json
+import settings as settings_mod
 from reward import (
-    compute_reward,
     ALIVE_BONUS,
     FALL_PENALTY,
-    ANGULAR_VEL_PENALTY,
-    ACTION_ENERGY_PENALTY,
     SENSOR_MATCH_BONUS,
     SENSOR_MATCH_TOLERANCE,
-    SENSOR_CONTACT_TOLERANCE,
 )
 from settings import (
     STACK_SIZE, OBS_DIM, STATE_DIM, ACTION_DIM, HIDDEN_DIM,
     ACTION_FORCE_MAGNITUDE, PERTURB_FORCE_SCALE, PERTURB_APPLY_STEPS,
     PERTURB_START_DELAY, PERTURB_RESAMPLE_EPISODES, ACTION_START_DELAY,
-    BOUNDARY_LIMIT, TILT_LIMIT_RADIANS, USE_OBS_NORMALIZATION
+    BOUNDARY_LIMIT, TILT_LIMIT_RADIANS, USE_OBS_NORMALIZATION,
+    PERTURB_CURRICULUM_RANGES, CURRICULUM_STAGE_EPISODES,
 )
-from features import build_observation, compute_tilt_angle, SENSOR_NAMES
+from features import (
+    build_observation,
+    compute_tilt_angle,
+    SENSOR_NAMES,
+    MID_ROW_INDICES,
+    ANGULAR_VEL_DIRECTION_THRESHOLD,
+)
 
 if __name__ == "__main__":
     # Ensure the module is discoverable as 'train_box_ppo' even when executed as a script.
@@ -147,30 +151,24 @@ def _compute_tilt_angle_batch(quat_batch):
     return np.arctan2(z_axis_x, z_axis_z)
 
 
-def _compute_reward_batch(obs_batch, tilt_angles, tilt_rates, action_forces, out_of_bounds_flags, tilt_limit):
-    obs_batch = np.nan_to_num(obs_batch, nan=0.0, posinf=0.0, neginf=0.0)
+def _compute_reward_batch(contact_batch, tilt_angles, tilt_rates, action_forces, out_of_bounds_flags, tilt_limit):
+    contact_batch = np.nan_to_num(contact_batch, nan=0.0, posinf=0.0, neginf=0.0)
     tilt_abs = np.abs(tilt_angles)
     alive_mask = (tilt_abs <= tilt_limit) & (~out_of_bounds_flags)
-
-    semi_suspended = np.any(np.abs(obs_batch) <= SENSOR_CONTACT_TOLERANCE, axis=1)
 
     rewards = np.empty_like(tilt_angles, dtype=np.float32)
     rewards[:] = -FALL_PENALTY
 
     if np.any(alive_mask):
         alive_idx = np.where(alive_mask)[0]
-        base_reward = np.zeros_like(alive_idx, dtype=np.float32)
-        not_suspended = ~semi_suspended[alive_idx]
-        base_reward[not_suspended] = ALIVE_BONUS
-        base_reward -= ANGULAR_VEL_PENALTY * (tilt_rates[alive_idx] ** 2)
-        base_reward -= ACTION_ENERGY_PENALTY * (action_forces[alive_idx] ** 2)
+        base_reward = np.full(alive_idx.shape, ALIVE_BONUS, dtype=np.float32)
 
         if SENSOR_MATCH_BONUS > 0.0:
-            sensors = obs_batch[alive_idx]
+            sensors = contact_batch[alive_idx]
             spread = np.max(sensors, axis=1) - np.min(sensors, axis=1)
             safe_tol = np.maximum(SENSOR_MATCH_TOLERANCE, 1e-8)
             match_score = np.clip(1.0 - spread / safe_tol, 0.0, 1.0)
-            base_reward += SENSOR_MATCH_BONUS * np.where(not_suspended, match_score, 0.0)
+            base_reward += SENSOR_MATCH_BONUS * match_score
 
         rewards[alive_idx] = base_reward
 
@@ -200,9 +198,12 @@ class MJXParallelEnv:
         self.nu = self.model.nu
         self.box_body_id = self.model.body('box_body').id
 
-        self.sensor_indices = np.array([self.model.sensor(name).adr for name in SENSOR_NAMES], dtype=np.int32)
-        self.middle_sensor_indices = np.array([3, 4, 5], dtype=np.int32)
+        self.sensor_indices = np.array([
+            self.model.sensor(name).adr for name in SENSOR_NAMES
+        ], dtype=np.int32)
+        self.middle_sensor_indices = np.array(MID_ROW_INDICES, dtype=np.int32)
         self._sensor_indices_device = jnp.asarray(self.sensor_indices)
+        self._vel_threshold = float(ANGULAR_VEL_DIRECTION_THRESHOLD)
 
         cpu_data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, cpu_data)
@@ -225,6 +226,32 @@ class MJXParallelEnv:
         mujoco.mj_forward(self.model, self._cpu_reset_data)
         return mujoco.mjx.put_data(self.model, self._cpu_reset_data)
 
+    def _sensor_grid(self):
+        sensor_vals = jnp.take(self.mjx_data.sensordata, self._sensor_indices_device, axis=1)
+        sensors = np.asarray(sensor_vals, dtype=np.float32)
+        if sensors.ndim == 3 and sensors.shape[-1] == 1:
+            sensors = np.squeeze(sensors, axis=-1)
+        return sensors
+
+    def _mid_row_contacts(self):
+        sensors = self._sensor_grid()
+        return sensors[:, self.middle_sensor_indices]
+
+    def _angular_velocity_direction_batch(self):
+        cvel = np.asarray(self.mjx_data.cvel[:, self.box_body_id, 1], dtype=np.float32)
+        direction = np.zeros_like(cvel)
+        direction[cvel > self._vel_threshold] = 1.0
+        direction[cvel < -self._vel_threshold] = -1.0
+        return direction
+
+    def _compute_observation_components(self):
+        mid_row = self._mid_row_contacts().astype(np.float32)
+        tilt_proxy = mid_row[:, 0] - mid_row[:, -1]
+        vel_direction = self._angular_velocity_direction_batch().astype(np.float32)
+        obs = np.stack([tilt_proxy, vel_direction], axis=1)
+        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        return obs, mid_row
+
     def reset(self, env_indices=None):
         if env_indices is None:
             env_indices = np.arange(self.num_envs)
@@ -238,12 +265,8 @@ class MJXParallelEnv:
         return obs
 
     def get_observation(self):
-        sensor_vals = jnp.take(self.mjx_data.sensordata, self._sensor_indices_device, axis=1)
-        sensors = np.asarray(sensor_vals, dtype=np.float32)
-        if sensors.ndim == 3 and sensors.shape[-1] == 1:
-            sensors = np.squeeze(sensors, axis=-1)
-        obs = sensors[:, self.middle_sensor_indices]
-        return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        obs, _ = self._compute_observation_components()
+        return obs
 
     def step(self, action_forces, perturb_forces):
         xfrc = np.zeros((self.num_envs, self.nbodies, 6), dtype=np.float32)
@@ -253,18 +276,46 @@ class MJXParallelEnv:
         xfrc = jnp.asarray(xfrc)
         ctrl = jnp.asarray(self._default_ctrl)
         self.mjx_data = self._step_fn(self.mjx_data, xfrc, ctrl)
-
-        sensors = self.get_observation()
+        obs_features, mid_contacts = self._compute_observation_components()
         quat = np.asarray(self.mjx_data.xquat[:, self.box_body_id], dtype=np.float32)
         tilt_angles = _compute_tilt_angle_batch(quat)
-        tilt_rates = np.asarray(self.mjx_data.cvel[:, self.box_body_id, 4], dtype=np.float32)
+        tilt_rates = np.asarray(self.mjx_data.cvel[:, self.box_body_id, 1], dtype=np.float32)
         xpos = np.asarray(self.mjx_data.xpos[:, self.box_body_id], dtype=np.float32)
-        return sensors, tilt_angles, tilt_rates, xpos
+        return obs_features, mid_contacts, tilt_angles, tilt_rates, xpos
 
 
-def _sample_startup_perturbation():
+def _sample_startup_perturbation(force_range=None):
+    """Sample a startup perturbation force along x using signed intervals.
+
+    force_range: tuple (min_abs, max_abs) describing absolute magnitudes. When
+    omitted, +/- PERTURB_FORCE_SCALE is used. Sampling respects the minimum
+    magnitude while extending the interval symmetrically into the negative
+    direction as requested.
+    """
+    if force_range is None:
+        min_abs = 0.0
+        max_abs = float(PERTURB_FORCE_SCALE)
+    else:
+        min_raw, max_raw = force_range
+        min_abs = abs(float(min_raw))
+        max_abs = abs(float(max_raw))
+
+    if max_abs < min_abs:
+        min_abs, max_abs = max_abs, min_abs
+
+    if max_abs == 0.0:
+        force_value = 0.0
+    elif min_abs <= 0.0:
+        low = -max_abs
+        high = max_abs
+        force_value = np.random.uniform(low, high) if high > low else float(high)
+    else:
+        magnitude = np.random.uniform(min_abs, max_abs) if max_abs > min_abs else float(min_abs)
+        sign = -1.0 if np.random.rand() < 0.5 else 1.0
+        force_value = sign * magnitude
+
     force = np.zeros(6, dtype=np.float32)
-    force[0] = np.random.uniform(-PERTURB_FORCE_SCALE, PERTURB_FORCE_SCALE)
+    force[0] = float(force_value)
     return force
 
 
@@ -690,8 +741,8 @@ def main():
     args = parser.parse_args()
 
     NUM_ENVS = int(os.environ.get("MJX_NUM_ENVS", os.environ.get("PPO_NUM_ENVS", "32")))
-    MAX_TRAINING_STEPS = 5000000
-    ROLLOUT_LENGTH = 256
+    MAX_TRAINING_STEPS = 6000000
+    ROLLOUT_LENGTH = 128
     BATCH_SIZE = 128
     PPO_EPOCHS = 16
     LR = 1e-4
@@ -764,6 +815,52 @@ def main():
                 print(f"Warning: observation stats file missing at {obs_path}")
 
             print(f"Resumed model weights from {model_path}")
+            # Record resume provenance: copy resume files into our save_root and write a resume_info file
+            try:
+                resume_out = os.path.join(save_root, 'resume_files')
+                os.makedirs(resume_out, exist_ok=True)
+                if os.path.exists(model_path):
+                    shutil.copy(model_path, os.path.join(resume_out, os.path.basename(model_path)))
+                if os.path.exists(obs_path):
+                    shutil.copy(obs_path, os.path.join(resume_out, os.path.basename(obs_path)))
+
+                # collect uppercase settings from settings.py into a serializable dict
+                try:
+                    settings_snapshot = {}
+                    for name in dir(settings_mod):
+                        if name.isupper():
+                            val = getattr(settings_mod, name)
+                            # convert numpy scalars or other simple types to native python types
+                            try:
+                                if hasattr(val, 'tolist'):
+                                    val = val.tolist()
+                                elif isinstance(val, (np.integer, np.floating)):
+                                    val = val.item()
+                            except Exception:
+                                pass
+                            settings_snapshot[name] = val
+                except Exception:
+                    settings_snapshot = None
+
+                resume_info = {
+                    'timestamp': datetime.now().isoformat(),
+                    'resume_dir': args.resume_dir,
+                    'resume_tag': args.resume_tag,
+                    'model_path': model_path if os.path.exists(model_path) else None,
+                    'obs_rms_path': obs_path if os.path.exists(obs_path) else None,
+                    'cmd_args': vars(args),
+                    'settings': settings_snapshot,
+                    'curriculum': {
+                        'ranges': [list(rng) for rng in PERTURB_CURRICULUM_RANGES],
+                        'stage_episodes': int(CURRICULUM_STAGE_EPISODES),
+                    },
+                }
+                info_path = os.path.join(save_root, 'resume_info.json')
+                with open(info_path, 'w', encoding='utf-8') as fh:
+                    json.dump(resume_info, fh, indent=2)
+                print(f"Saved resume info and copies to {resume_out} and {info_path}")
+            except Exception as copy_err:
+                print(f"Warning: failed to record resume provenance: {copy_err}")
         except Exception as resume_err:
             print(f"Warning: failed to resume from {args.resume_dir}: {resume_err}")
 
@@ -790,6 +887,46 @@ def main():
         shutil.copy(rms_path, os.path.join(latest_dir, rms_filename))
         return model_path, rms_path
 
+    def run_validation_pass(label, model_path, rms_path, total_steps, episodes=1):
+        try:
+            from validate_best import run_validation
+
+            validation_base_dir = os.path.join(save_root, "validation")
+            os.makedirs(validation_base_dir, exist_ok=True)
+
+            file_prefix = f"{label}_step_{total_steps}"
+            val_rewards, fig_paths = run_validation(
+                model_path,
+                rms_path,
+                episodes=episodes,
+                render=False,
+                max_steps=MAX_EPISODE_STEPS,
+                save_dir=validation_base_dir,
+                file_prefix=file_prefix,
+            )
+
+            if val_rewards:
+                val_reward = float(val_rewards[0])
+                final_plot_path = None
+                if fig_paths:
+                    src_path = fig_paths[0]
+                    dst_name = f"{file_prefix}_reward_{val_reward:.2f}.png"
+                    dst_path = os.path.join(validation_base_dir, dst_name)
+                    try:
+                        if src_path != dst_path:
+                            os.replace(src_path, dst_path)
+                        final_plot_path = dst_path
+                    except Exception:
+                        final_plot_path = src_path
+                if final_plot_path:
+                    print(f"[Validation-{label}] Primary validation plot: {final_plot_path}")
+                else:
+                    print(f"[Validation-{label}] Reward: {val_reward:.2f}")
+            else:
+                print(f"[Validation-{label}] Automatic validation produced no reward data.")
+        except Exception as val_err:
+            print(f"Warning: automatic validation for {label} failed: {val_err}")
+
     obs = env.reset()
     obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
     if obs_rms is not None:
@@ -802,10 +939,61 @@ def main():
     state_stacker.reset(initial_obs=obs_norm)
     state = state_stacker.get_state()
 
+    curriculum_ranges = list(PERTURB_CURRICULUM_RANGES) if PERTURB_CURRICULUM_RANGES else []
+    if not curriculum_ranges:
+        curriculum_ranges = [(0.0, float(PERTURB_FORCE_SCALE))]
+    curriculum_stage = 0
+    curriculum_stage_len = max(1, int(CURRICULUM_STAGE_EPISODES))
+    curriculum_transitions = []
+
+    def describe_curriculum_range(range_pair):
+        min_raw, max_raw = range_pair
+        min_abs = abs(float(min_raw))
+        max_abs = abs(float(max_raw))
+        if max_abs < min_abs:
+            min_abs, max_abs = max_abs, min_abs
+        if max_abs == 0.0:
+            return "[0.0]"
+        if min_abs <= 0.0:
+            return f"[{-max_abs:.1f}, {max_abs:.1f}]"
+        return (
+            f"[{-max_abs:.1f}, {-min_abs:.1f}] U "
+            f"[{min_abs:.1f}, {max_abs:.1f}]"
+        )
+
+    def get_curriculum_range(stage_idx=None):
+        idx = curriculum_stage if stage_idx is None else stage_idx
+        idx = max(0, min(idx, len(curriculum_ranges) - 1))
+        return curriculum_ranges[idx]
+
+    def maybe_advance_curriculum(total_completed_episodes):
+        nonlocal curriculum_stage
+        completed_stages = []
+        while (
+            curriculum_stage < len(curriculum_ranges) - 1
+            and total_completed_episodes >= (curriculum_stage + 1) * curriculum_stage_len
+        ):
+            completed_stage_number = curriculum_stage + 1
+            curriculum_stage += 1
+            new_range = get_curriculum_range()
+            stage_number = curriculum_stage + 1
+            curriculum_transitions.append((total_completed_episodes, stage_number))
+            for env_idx in range(NUM_ENVS):
+                perturb_forces[env_idx] = _sample_startup_perturbation(new_range)
+            print(
+                f"[Curriculum] Advanced to stage {curriculum_stage + 1}/{len(curriculum_ranges)} "
+                f"with perturb range {describe_curriculum_range(new_range)} "
+                f"at episode {total_completed_episodes}"
+            )
+            completed_stages.append((completed_stage_number, total_completed_episodes))
+        return completed_stages
+
     episode_rewards = np.zeros(NUM_ENVS, dtype=np.float32)
     episode_steps = np.zeros(NUM_ENVS, dtype=np.int32)
     episode_counts = np.zeros(NUM_ENVS, dtype=np.int64)
-    perturb_forces = np.vstack([_sample_startup_perturbation() for _ in range(NUM_ENVS)])
+    perturb_forces = np.vstack([
+        _sample_startup_perturbation(get_curriculum_range()) for _ in range(NUM_ENVS)
+    ])
     perturb_steps_remaining = np.zeros(NUM_ENVS, dtype=np.int32)
     perturb_started = np.zeros(NUM_ENVS, dtype=bool)
 
@@ -813,6 +1001,11 @@ def main():
     best_episode_reward = -1e9
     total_steps = 0
     global_episode_counter = 0
+
+    print(
+        f"[Curriculum] Starting at stage {curriculum_stage + 1}/{len(curriculum_ranges)} "
+        f"with perturb range {describe_curriculum_range(get_curriculum_range())}"
+    )
 
     print(f"Starting PPO training with MJX across {NUM_ENVS} environments...")
 
@@ -853,9 +1046,9 @@ def main():
             perturb_batch[active_mask] = perturb_forces[active_mask]
             perturb_steps_remaining[active_mask] -= 1
 
-        sensors, tilt_angles, tilt_rates, xpos = env.step(action_forces, perturb_batch)
+        obs_features, contact_batch, tilt_angles, tilt_rates, xpos = env.step(action_forces, perturb_batch)
         out_of_bounds = (np.abs(xpos[:, 0]) > BOUNDARY_LIMIT) | (np.abs(xpos[:, 1]) > BOUNDARY_LIMIT)
-        rewards, alive_mask = _compute_reward_batch(sensors, tilt_angles, tilt_rates, action_forces, out_of_bounds, TILT_LIMIT_RADIANS)
+        rewards, alive_mask = _compute_reward_batch(contact_batch, tilt_angles, tilt_rates, action_forces, out_of_bounds, TILT_LIMIT_RADIANS)
 
         next_episode_steps = episode_steps + 1
         timeout_mask = next_episode_steps >= MAX_EPISODE_STEPS
@@ -864,7 +1057,7 @@ def main():
         episode_rewards += rewards
         total_steps += NUM_ENVS
 
-        obs_batch = np.nan_to_num(sensors, nan=0.0, posinf=1e6, neginf=-1e6)
+        obs_batch = np.nan_to_num(obs_features, nan=0.0, posinf=1e6, neginf=-1e6)
         if obs_rms is not None:
             obs_rms.update(obs_batch)
             obs_norm = obs_rms.normalize(obs_batch)
@@ -896,50 +1089,30 @@ def main():
             for idx, ep_reward in zip(done_indices, done_rewards):
                 completed_episode_rewards.append(float(ep_reward))
                 global_episode_counter += 1
+                stage_completion_events = maybe_advance_curriculum(global_episode_counter)
+                if stage_completion_events:
+                    for completed_stage_number, completion_episode in stage_completion_events:
+                        stage_suffix = f"stage{completed_stage_number:02d}"
+                        stage_model_path, stage_rms_path = save_model_and_stats(stage_suffix)
+                        print(
+                            f"[Curriculum] Stage {completed_stage_number} completed at episode {completion_episode}; "
+                            f"saved snapshot to {stage_model_path}"
+                        )
+                        run_validation_pass(stage_suffix, stage_model_path, stage_rms_path, total_steps)
+                    best_episode_reward = -1e9
+                    print(
+                        f"[Curriculum] Reset best_episode_reward for new stage "
+                        f"({curriculum_stage + 1}/{len(curriculum_ranges)})"
+                    )
                 if ep_reward > best_episode_reward:
                     best_episode_reward = ep_reward
                     best_model_path, best_rms_path = save_model_and_stats("best", best=True)
                     print(f"New best model saved ({save_root}) (episode {global_episode_counter}) with reward {ep_reward:.2f}")
-                    try:
-                        from validate_best import run_validation
-
-                        validation_base_dir = os.path.join(save_root, "validation")
-                        os.makedirs(validation_base_dir, exist_ok=True)
-
-                        file_prefix = f"best_step_{total_steps}"
-                        val_rewards, fig_paths = run_validation(
-                            best_model_path,
-                            best_rms_path,
-                            episodes=1,
-                            render=False,
-                            max_steps=MAX_EPISODE_STEPS,
-                            save_dir=validation_base_dir,
-                            file_prefix=file_prefix,
-                        )
-
-                        if val_rewards:
-                            val_reward = float(val_rewards[0])
-                            final_plot_path = None
-                            if fig_paths:
-                                src_path = fig_paths[0]
-                                dst_name = f"{file_prefix}_reward_{val_reward:.2f}.png"
-                                dst_path = os.path.join(validation_base_dir, dst_name)
-                                try:
-                                    if src_path != dst_path:
-                                        os.replace(src_path, dst_path)
-                                    final_plot_path = dst_path
-                                except Exception:
-                                    final_plot_path = src_path
-                            if final_plot_path:
-                                print(f"Primary validation plot: {final_plot_path}")
-                        else:
-                            print("Automatic validation produced no reward data.")
-                    except Exception as val_err:
-                        print(f"Warning: automatic validation after best save failed: {val_err}")
+                    run_validation_pass("best", best_model_path, best_rms_path, total_steps)
 
             resample_indices = [idx for idx in done_indices if episode_counts[idx] % PERTURB_RESAMPLE_EPISODES == 0]
             for idx in resample_indices:
-                perturb_forces[idx] = _sample_startup_perturbation()
+                perturb_forces[idx] = _sample_startup_perturbation(get_curriculum_range())
 
             obs_after_reset = env.reset(done_indices)
             reset_obs = np.nan_to_num(obs_after_reset[done_indices], nan=0.0, posinf=1e6, neginf=-1e6)
@@ -992,10 +1165,40 @@ def main():
 
     if completed_episode_rewards:
         plt.figure(figsize=(10, 5))
-        plt.plot(completed_episode_rewards)
+        episodes = np.arange(1, len(completed_episode_rewards) + 1)
+        plt.plot(episodes, completed_episode_rewards, label="Episode Reward")
         plt.title("Episode Rewards over Time")
         plt.xlabel("Episode")
         plt.ylabel("Total Reward")
+        if curriculum_transitions:
+            ymin, ymax = plt.ylim()
+            if ymax <= ymin:
+                ymax = ymin + 1.0
+            text_y = ymax - 0.02 * (ymax - ymin)
+            marker_label_used = False
+            for raw_episode_idx, stage_number in curriculum_transitions:
+                episode_idx = min(max(int(raw_episode_idx), 1), len(completed_episode_rewards))
+                line_label = "Curriculum stage change" if not marker_label_used else None
+                plt.axvline(
+                    x=episode_idx,
+                    color="orange",
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.7,
+                    label=line_label,
+                )
+                plt.text(
+                    episode_idx,
+                    text_y,
+                    f"Stage {stage_number}",
+                    rotation=90,
+                    va="top",
+                    ha="right",
+                    fontsize=8,
+                    color="orange",
+                )
+                marker_label_used = True
+        plt.legend()
         plt.savefig(os.path.join(save_root, "box_ppo_rewards.png"))
         print(f"Saved reward plot to {os.path.join(save_root, 'box_ppo_rewards.png')}")
     else:
@@ -1017,8 +1220,9 @@ def main():
     eval_episode_step = 0
     eval_active_perturb_steps_remaining = 0
     eval_perturb_started = False
-    eval_active_perturb_force = np.zeros(6, dtype=np.float32)
-    eval_active_perturb_force[0] = np.random.uniform(-PERTURB_FORCE_SCALE, PERTURB_FORCE_SCALE)
+    eval_active_perturb_force = _sample_startup_perturbation(
+        PERTURB_CURRICULUM_RANGES[-1] if PERTURB_CURRICULUM_RANGES else None
+    )
     try:
         action_gid = mujoco.mj_name2id(eval_model, mujoco.mjtObj.mjOBJ_GEOM, 'action_indicator')
         have_action_indicator = True
@@ -1082,14 +1286,18 @@ def main():
             eval_episode_step = 0
             eval_active_perturb_steps_remaining = 0
             eval_perturb_started = False
-            eval_active_perturb_force[0] = np.random.uniform(-PERTURB_FORCE_SCALE, PERTURB_FORCE_SCALE)
+            eval_active_perturb_force = _sample_startup_perturbation(
+                PERTURB_CURRICULUM_RANGES[-1] if PERTURB_CURRICULUM_RANGES else None
+            )
             continue
         if is_done(data):
             reset_sim(eval_model, data, state_stacker, obs_rms)
             eval_episode_step = 0
             eval_active_perturb_steps_remaining = 0
             eval_perturb_started = False
-            eval_active_perturb_force[0] = np.random.uniform(-PERTURB_FORCE_SCALE, PERTURB_FORCE_SCALE)
+            eval_active_perturb_force = _sample_startup_perturbation(
+                PERTURB_CURRICULUM_RANGES[-1] if PERTURB_CURRICULUM_RANGES else None
+            )
         else:
             eval_episode_step += 1
 

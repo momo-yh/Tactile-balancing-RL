@@ -13,7 +13,6 @@ Requires mujoco Python bindings available in the environment.
 """
 
 import os
-import time
 from datetime import datetime
 import numpy as np
 import matplotlib
@@ -33,11 +32,11 @@ def get_observation(data):
     return build_observation(data)
 
 # Configuration
-FORCES = [1, 5, 10, 20, 30, 40, 50, 70, 80, 90, 100, 150, 200]  # forces in +x direction to test
+FORCES = [200]  # forces in +x direction to test
 # Number of simulation steps the force is actively applied (1 as requested)
 APPLIED_STEPS = 1
 # Number of steps to record after the applied impulse
-RECORD_STEPS = 300
+RECORD_STEPS = 1000
 # Begin applying the force at this (1-based) step index after reset
 APPLY_AT_STEP = 150
 MODEL_PATH = "model.xml"
@@ -50,8 +49,10 @@ def run_test():
     data = mujoco.MjData(model)
     box_body_id = data.body('box_body').id
 
-    # store per-force per-step mid-row sensor readings (steps x 3)
-    all_mid = {}  # force -> array shape (STEPS_PER_FORCE, 3)
+    # store per-force per-step observation features (tilt diff, acceleration sign)
+    all_obs = {}  # force -> array shape (STEPS_PER_FORCE, 2)
+    # store per-force per-step x-position of the box body (steps,)
+    all_xpos = {}  # force -> array shape (STEPS_PER_FORCE,)
 
     for f in FORCES:
         print(f"Running force {f}: apply {APPLIED_STEPS} step(s), then record {RECORD_STEPS} steps...")
@@ -63,7 +64,8 @@ def run_test():
         pre_steps = max(0, APPLY_AT_STEP - 1)
         total_steps = pre_steps + APPLIED_STEPS + RECORD_STEPS
 
-        mid_vals = []
+        obs_vals = []
+        xpos_vals = []
         for t in range(1, total_steps + 1):
             # apply force only during the APPLIED_STEPS starting at APPLY_AT_STEP
             if (t >= APPLY_AT_STEP) and (t < APPLY_AT_STEP + APPLIED_STEPS):
@@ -74,60 +76,100 @@ def run_test():
 
             mujoco.mj_step(model, data)
 
+            # record observation feature values (tilt difference and acceleration sign)
             obs = get_observation(data)
-            # observation already contains only the three middle-row sensors
-            mid = [float(obs[0]), float(obs[1]), float(obs[2])]
-            mid_vals.append(mid)
+            if obs.size >= 2:
+                obs_vals.append([float(obs[0]), float(obs[1])])
+            else:
+                obs_vals.append([0.0, 0.0])
+            # record bottom-right site x-position (world frame)
+            try:
+                site_x = float(data.site('site_p1_m1').xpos[0])
+            except Exception:
+                # fallback to body xpos if site not found
+                try:
+                    site_x = float(data.body('box_body').xpos[0])
+                except Exception:
+                    site_x = 0.0
+            xpos_vals.append(site_x)
 
         # convert to array and store for this force
-        mid_arr = np.array(mid_vals, dtype=np.float32)  # shape (RECORD_STEPS, 3)
-        all_mid[f] = mid_arr
+        obs_arr = np.array(obs_vals, dtype=np.float32)  # shape (STEPS, 2)
+        xpos_arr = np.array(xpos_vals, dtype=np.float32)  # shape (STEPS,)
+        # calibrate baseline using pre-impulse steps (use mean of pre_steps)
+        if pre_steps > 0:
+            baseline = float(xpos_arr[:pre_steps].mean())
+        else:
+            baseline = float(xpos_arr[0]) if xpos_arr.size > 0 else 0.0
+        # store displacement relative to baseline
+        disp_arr = xpos_arr - baseline
+        all_obs[f] = obs_arr
+        all_xpos[f] = disp_arr
     # Compute and print/save maxima for each force (each plotted line)
     ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-    print('\nMaximum values for each force and middle-row sensor:')
-    sensor_names = ['sensor_p1_0', 'sensor_0_0', 'sensor_m1_0']
+    print('\nMin/Max values for each force observation feature (and final x-position):')
+    feature_names = ['tilt_diff', 'ang_vel_direction']
     # Print header
-    print(','.join(['force'] + sensor_names))
+    print(','.join(['force'] + [f"{name}_min" for name in feature_names] + [f"{name}_max" for name in feature_names]))
     for f in FORCES:
-        arr = all_mid[f]
+        arr = all_obs[f]
+        mins = arr.min(axis=0)
         maxs = arr.max(axis=0)
-        print(f"{f},{maxs[0]:.6f},{maxs[1]:.6f},{maxs[2]:.6f}")
+        print(f"{f},{mins[0]:.6f},{mins[1]:.6f},{maxs[0]:.6f},{maxs[1]:.6f}")
 
-    # Save maxima to CSV for later inspection
-    csv_path = os.path.join(SAVE_DIR, f'force_midrow_max_{ts}.csv')
+    # Save maxima to CSV for later inspection (also include final x-position)
+    csv_path = os.path.join(SAVE_DIR, f'force_observation_extrema_{ts}.csv')
     with open(csv_path, 'w') as fh:
-        fh.write(','.join(['force'] + sensor_names) + '\n')
+        header = ['force']
+        header += [f"{name}_min" for name in feature_names]
+        header += [f"{name}_max" for name in feature_names]
+        header.append('xpos_final')
+        fh.write(','.join(header) + '\n')
         for f in FORCES:
-            m = all_mid[f].max(axis=0)
-            fh.write(f"{f},{m[0]},{m[1]},{m[2]}\n")
+            arr = all_obs[f]
+            mins = arr.min(axis=0)
+            maxs = arr.max(axis=0)
+            xpos_final = float(all_xpos[f][-1]) if (f in all_xpos and all_xpos[f].size > 0) else 0.0
+            fh.write(
+                f"{f},{mins[0]},{mins[1]},{maxs[0]},{maxs[1]},{xpos_final}\n"
+            )
     print(f"Saved maxima CSV to: {csv_path}\n")
 
     # Plot all traces on the same figure
     ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-    fname = os.path.join(SAVE_DIR, f'force_midrow_compare_{ts}.png')
+    fname = os.path.join(SAVE_DIR, f'force_observation_compare_{ts}.png')
 
-    plt.figure(figsize=(12, 6))
     pre_steps = max(0, APPLY_AT_STEP - 1)
     total_steps = pre_steps + APPLIED_STEPS + RECORD_STEPS
     xs = np.arange(1, total_steps + 1)
-    # Names for the three middle-row sensors (based on get_observation ordering)
-    sensor_names = ['sensor_p1_0', 'sensor_0_0', 'sensor_m1_0']
 
-    fig, axs = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-    for i in range(3):
+    # Names for observation features
+    feature_labels = ['tilt_diff', 'ang_vel_direction']
+
+    # Create 3 subplots: two observation features + one for box x-position
+    fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    for i in range(2):
         ax = axs[i]
         for f in FORCES:
-            ax.plot(xs, all_mid[f][:, i], label=f"force={f}")
-        ax.set_ylabel(sensor_names[i])
+            ax.plot(xs, all_obs[f][:, i], label=f"force={f}")
+        ax.set_ylabel(feature_labels[i])
         ax.grid(True)
         ax.legend(loc='upper right')
 
-    axs[-1].set_xlabel('Step')
-    fig.suptitle(f'Middle-row sensor response: {APPLIED_STEPS}-step impulse at step {APPLY_AT_STEP} (recorded {total_steps} steps)')
+    # Third subplot: box x-position
+    ax = axs[2]
+    for f in FORCES:
+        if f in all_xpos:
+            ax.plot(xs, all_xpos[f], label=f"force={f}")
+    ax.set_ylabel('box_xpos (m)')
+    ax.set_xlabel('Step')
+    ax.grid(True)
+    ax.legend(loc='upper right')
+
+    fig.suptitle(f'Observation features + box x-position: {APPLIED_STEPS}-step impulse at step {APPLY_AT_STEP} (recorded {total_steps} steps)')
     # annotate impulse step on each subplot
-    for ax in axs:
-        ax.axvline(APPLY_AT_STEP, color='k', linestyle='--', linewidth=0.8, label='impulse')
-    plt.grid(True)
+    for a in axs:
+        a.axvline(APPLY_AT_STEP, color='k', linestyle='--', linewidth=0.8, label='impulse')
     plt.tight_layout()
     plt.savefig(fname)
     plt.close()
