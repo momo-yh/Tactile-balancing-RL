@@ -217,12 +217,6 @@ class MJXParallelEnv:
 
     def _reset_single(self):
         mujoco.mj_resetData(self.model, self._cpu_reset_data)
-        angle = np.random.uniform(-0.1, 0.1)
-        axis = np.random.normal(size=3)
-        axis /= (np.linalg.norm(axis) + 1e-12)
-        qw = np.cos(angle * 0.5)
-        qxyz = axis * np.sin(angle * 0.5)
-        self._cpu_reset_data.qpos[3:7] = [float(qw), float(qxyz[0]), float(qxyz[1]), float(qxyz[2])]
         mujoco.mj_forward(self.model, self._cpu_reset_data)
         return mujoco.mjx.put_data(self.model, self._cpu_reset_data)
 
@@ -708,15 +702,6 @@ def is_done(data):
 def reset_sim(model, data, state_stacker, obs_rms=None):
     """Reset the simulation."""
     mujoco.mj_resetData(model, data)
-    # Give a small random initial rotation using a normalized quaternion.
-    # Sample a small random axis-angle perturbation (angle in radians up to 0.1)
-    angle = np.random.uniform(-0.1, 0.1)
-    axis = np.random.normal(size=3)
-    axis = axis / (np.linalg.norm(axis) + 1e-12)
-    qw = np.cos(angle * 0.5)
-    qxyz = axis * np.sin(angle * 0.5)
-    # quaternion ordering in qpos is [w, x, y, z]
-    data.qpos[3:7] = [float(qw), float(qxyz[0]), float(qxyz[1]), float(qxyz[2])]
     mujoco.mj_forward(model, data)
 
     initial_obs = get_observation(data)
@@ -745,15 +730,16 @@ def main():
     args = parser.parse_args()
 
     NUM_ENVS = int(os.environ.get("MJX_NUM_ENVS", os.environ.get("PPO_NUM_ENVS", "32")))
-    MAX_TRAINING_STEPS = 6000000
-    ROLLOUT_LENGTH = 128
+    MAX_TRAINING_STEPS = 10000000
+    ROLLOUT_LENGTH = 1024
     BATCH_SIZE = 128
-    PPO_EPOCHS = 16
+    PPO_EPOCHS = 32
     LR = 1e-4
     ENTROPY_COEF = 0.01
     LR_DECAY_FRACTION = float(os.environ.get("LR_DECAY_FRACTION", "0.75"))
     LR_DECAY_GAMMA = float(os.environ.get("LR_DECAY_GAMMA", "0.1"))
     MAX_EPISODE_STEPS = 2000
+    VALIDATION_STEP_GAP = int(os.environ.get("VALIDATION_STEP_GAP", "200000"))
 
     if os.environ.get("SHORT_TEST", "0") == "1":
         MAX_TRAINING_STEPS = 20000
@@ -891,6 +877,8 @@ def main():
         shutil.copy(rms_path, os.path.join(latest_dir, rms_filename))
         return model_path, rms_path
 
+    last_validation_step = -VALIDATION_STEP_GAP
+
     def run_validation_pass(label, model_path, rms_path, total_steps, episodes=1):
         try:
             from validate_best import run_validation
@@ -930,6 +918,14 @@ def main():
                 print(f"[Validation-{label}] Automatic validation produced no reward data.")
         except Exception as val_err:
             print(f"Warning: automatic validation for {label} failed: {val_err}")
+
+    def maybe_run_validation(label, model_path, rms_path, total_steps, episodes=1):
+        nonlocal last_validation_step
+        if VALIDATION_STEP_GAP <= 0 or (total_steps - last_validation_step) >= VALIDATION_STEP_GAP:
+            run_validation_pass(label, model_path, rms_path, total_steps, episodes)
+            last_validation_step = total_steps
+        else:
+            pass
 
     obs = env.reset()
     obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -1073,10 +1069,11 @@ def main():
         else:
             obs_norm = obs_batch
 
+        state_to_store = np.array(state, copy=True)
         state_stacker.push(obs_norm)
         next_state = state_stacker.get_state()
 
-        stored = agent.store_transition(state, actions, rewards, done_mask.astype(np.float32), log_prob_batch, value_batch)
+        stored = agent.store_transition(state_to_store, actions, rewards, done_mask.astype(np.float32), log_prob_batch, value_batch)
         if stored:
             agent.update(next_state, done_mask.astype(np.float32))
 
@@ -1102,7 +1099,7 @@ def main():
                             f"[Curriculum] Stage {completed_stage_number} completed at episode {completion_episode}; "
                             f"saved snapshot to {stage_model_path}"
                         )
-                        run_validation_pass(stage_suffix, stage_model_path, stage_rms_path, total_steps)
+                        maybe_run_validation(stage_suffix, stage_model_path, stage_rms_path, total_steps)
                     best_episode_reward = -1e9
                     print(
                         f"[Curriculum] Reset best_episode_reward for new stage "
@@ -1112,7 +1109,7 @@ def main():
                     best_episode_reward = ep_reward
                     best_model_path, best_rms_path = save_model_and_stats("best", best=True)
                     print(f"New best model saved ({save_root}) (episode {global_episode_counter}) with reward {ep_reward:.2f}")
-                    run_validation_pass("best", best_model_path, best_rms_path, total_steps)
+                    maybe_run_validation("best", best_model_path, best_rms_path, total_steps)
 
             resample_indices = [idx for idx in done_indices if episode_counts[idx] % PERTURB_RESAMPLE_EPISODES == 0]
             for idx in resample_indices:

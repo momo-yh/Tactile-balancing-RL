@@ -31,7 +31,7 @@ def run_validation(
     max_steps=1000,
     save_dir=None,
     file_prefix=None,
-    force_given=300,
+    force_given=200,
 ):
     model = mujoco.MjModel.from_xml_path("model.xml")
     data = mujoco.MjData(model)

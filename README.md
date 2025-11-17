@@ -13,10 +13,10 @@ This repository contains a MuJoCo-based balancing task where a neural policy lea
 
 ### Reward shaping (`reward.py`)
 
-- **Alive bonus**: `ALIVE_BONUS` (default `+10`) is granted only when all three tactile sensors report contact (`|sensor| > SENSOR_CONTACT_TOLERANCE`) and the tilt stays below `±TILT_LIMIT_DEGREES`.
+- **Alive bonus**: `ALIVE_BONUS` (default `+1`) is granted every step that stays within the tilt limit; tactile contact gating has been removed.
 - **Smoothness penalties**: Legacy angular-velocity and action-energy penalties have been removed from the current reward to simplify tuning.
-- **Sensor agreement bonus**: When the three sensors agree, a graded bonus up to `SENSOR_MATCH_BONUS` (default `10`) is added. The bonus scales linearly with the spread (`max(sensor) - min(sensor)`); perfect agreement (`spread = 0`) yields the full reward, and the contribution tapers to zero once the spread exceeds `SENSOR_MATCH_TOLERANCE`.
-- **Failure penalty**: `-FALL_PENALTY` (default `-100`) triggers when the tilt or position exits the safe region.
+- **Sensor agreement bonus**: A graded bonus up to `SENSOR_MATCH_BONUS` (default `+3`) encourages the three tactile sensors to agree; the contribution decreases linearly with the spread (`max(sensor) - min(sensor)`) and vanishes once the spread exceeds `SENSOR_MATCH_TOLERANCE`.
+- **Failure penalty**: `-FALL_PENALTY` (default `-10`) triggers when the tilt or position exits the safe region.
 
 Episodes terminate immediately on failure or after the configured step horizon (`MAX_EPISODE_STEPS`).
 
@@ -76,7 +76,7 @@ See `reward.py` for exact constants and defaults.
 
 PPO update sample count per update (single env): `ROLLOUT_LENGTH`. With defaults: 512 samples → 512/128 = 4 minibatches per update.
 
-The training loop also uses delayed action start (`ACTION_START_DELAY`) and startup perturbations (`PERTURB_*`) to test robustness.
+The training loop also uses delayed action start (`ACTION_START_DELAY`) and startup perturbations (`PERTURB_*`) to test robustness. Episodes reset to whatever default pose is defined in `model.xml` (currently upright), while the startup perturbation force is resampled within the configured range (including sign) to preserve randomness across runs.
 
 ## 7) Environment variables
 
@@ -85,6 +85,7 @@ The training loop also uses delayed action start (`ACTION_START_DELAY`) and star
 - `LR_DECAY_FRACTION`: when to trigger LR decay (default 0.75 of expected updates).
 - `LR_DECAY_GAMMA`: multiplicative LR drop (default 0.1; use 1.0 to disable).
 - `PERIODIC_SAVE_STEPS`: step interval for periodic “last” checkpoints (default set in code).
+- `VALIDATION_STEP_GAP`: minimum number of environment steps between automatic validation passes (default 200,000; set to 0 to validate every time).
 
 ## 8) Learning‑rate scheduling
 

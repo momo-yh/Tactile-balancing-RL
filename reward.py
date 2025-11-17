@@ -6,7 +6,7 @@ from features import compute_tilt_angle, mid_row_sensors
 # Default reward coefficients (can be overridden via environment variables)
 ALIVE_BONUS = float(os.environ.get("ALIVE_BONUS", "1.0"))
 FALL_PENALTY = float(os.environ.get("FALL_PENALTY", "10.0"))
-SENSOR_MATCH_BONUS = float(os.environ.get("SENSOR_MATCH_BONUS", "3"))
+SENSOR_MATCH_BONUS = float(os.environ.get("SENSOR_MATCH_BONUS", "1"))
 SENSOR_MATCH_TOLERANCE = float(os.environ.get("SENSOR_MATCH_TOLERANCE", "1"))
 SENSOR_CONTACT_TOLERANCE = float(os.environ.get("SENSOR_CONTACT_TOLERANCE", "0.01"))
 
@@ -34,10 +34,9 @@ def compute_reward(data, action_force, tilt_limit_rad, out_of_bounds=False):
     if alive:
         sensors = mid_row_sensors(data).astype(np.float32)
         sensors = np.nan_to_num(sensors, nan=0.0, posinf=0.0, neginf=0.0)
-        semi_suspended = bool(np.any(np.abs(sensors) <= SENSOR_CONTACT_TOLERANCE))
 
-        reward = 0.0 if semi_suspended else ALIVE_BONUS
-        if SENSOR_MATCH_BONUS > 0.0 and not semi_suspended:
+        reward = ALIVE_BONUS
+        if SENSOR_MATCH_BONUS > 0.0:
             spread = float(np.max(sensors) - np.min(sensors))
             match_score = max(0.0, 1.0 - spread / max(SENSOR_MATCH_TOLERANCE, 1e-8))
             reward += SENSOR_MATCH_BONUS * match_score
