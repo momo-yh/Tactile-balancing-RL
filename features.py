@@ -7,7 +7,6 @@ SENSOR_NAMES = [
 ]
 
 MID_ROW_INDICES = (3, 4, 5)
-ANGULAR_VEL_DIRECTION_THRESHOLD = 0.01
 
 
 def _box_body(data):
@@ -40,14 +39,6 @@ def mid_row_sensors(data):
         return np.zeros(3, dtype=np.float32)
 
 
-def _quantize_direction(value, threshold=ANGULAR_VEL_DIRECTION_THRESHOLD):
-    if value > threshold:
-        return 1.0
-    if value < -threshold:
-        return -1.0
-    return 0.0
-
-
 def compute_tilt_angle(data):
     """Signed tilt (radians) around the world y-axis."""
     try:
@@ -74,9 +65,8 @@ def compute_tilt_rate(data):
 
 
 def build_observation(data):
-    """Observation vector with tilt proxy and angular velocity direction sign."""
+    """Observation vector with tilt proxy and raw angular velocity."""
     middle_row = mid_row_sensors(data)
     tilt_proxy = float(middle_row[0] - middle_row[2])
     angular_vel = compute_tilt_rate(data)
-    vel_direction = _quantize_direction(angular_vel)
-    return np.asarray([tilt_proxy, vel_direction], dtype=np.float32)
+    return np.asarray([tilt_proxy, float(angular_vel)], dtype=np.float32)

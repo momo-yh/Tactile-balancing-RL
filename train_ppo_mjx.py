@@ -1,9 +1,5 @@
 import argparse
 import mujoco
-import mujoco.mjx
-import jax
-import jax.numpy as jnp
-import xml.etree.ElementTree as ET
 import numpy as np
 import time
 from datetime import datetime
@@ -20,12 +16,7 @@ import os
 import sys
 import json
 import settings as settings_mod
-from reward import (
-    ALIVE_BONUS,
-    FALL_PENALTY,
-    SENSOR_MATCH_BONUS,
-    SENSOR_MATCH_TOLERANCE,
-)
+from reward import compute_reward
 from settings import (
     STACK_SIZE, OBS_DIM, STATE_DIM, ACTION_DIM, HIDDEN_DIM,
     ACTION_FORCE_MAGNITUDE, PERTURB_FORCE_SCALE, PERTURB_APPLY_STEPS,
@@ -36,9 +27,8 @@ from settings import (
 from features import (
     build_observation,
     compute_tilt_angle,
-    SENSOR_NAMES,
-    MID_ROW_INDICES,
-    ANGULAR_VEL_DIRECTION_THRESHOLD,
+    compute_tilt_rate,
+    tactile_sensors,
 )
 
 if __name__ == "__main__":
@@ -113,169 +103,100 @@ class BatchedStateStacker:
         return self.buffer.reshape(self.batch_size, -1)
 
 
-def _replicate_mjx_data(single_data, batch_size):
-    def _expand(arr):
-        return jnp.repeat(jnp.expand_dims(jnp.asarray(arr), axis=0), batch_size, axis=0)
-
-    return jax.tree_util.tree_map(_expand, single_data)
-
-
-def _load_sanitized_model(model_path):
-    with open(model_path, "r", encoding="utf-8") as fh:
-        xml_text = fh.read()
-    root = ET.fromstring(xml_text)
-    for actuator in root.findall("actuator"):
-        root.remove(actuator)
-    sanitized_xml = ET.tostring(root, encoding="unicode")
-    mj_model = mujoco.MjModel.from_xml_string(sanitized_xml)
-    return mj_model, sanitized_xml
-
-
-def _update_env_slices(batch_tree, env_indices, *single_trees):
-    def _update_leaf(batch_leaf, *single_leaf_list):
-        batch_np = np.asarray(batch_leaf).copy()
-        for idx, single_leaf in zip(env_indices, single_leaf_list):
-            batch_np[idx] = single_leaf
-        return batch_np
-
-    return jax.tree_util.tree_map(_update_leaf, batch_tree, *single_trees)
-
-
-def _compute_tilt_angle_batch(quat_batch):
-    w = quat_batch[:, 0]
-    x = quat_batch[:, 1]
-    y = quat_batch[:, 2]
-    z = quat_batch[:, 3]
-    z_axis_x = 2.0 * (x * z - w * y)
-    z_axis_z = 1.0 - 2.0 * (x ** 2 + y ** 2)
-    return np.arctan2(z_axis_x, z_axis_z)
-
-
-def _compute_reward_batch(contact_batch, tilt_angles, tilt_rates, action_forces, out_of_bounds_flags, tilt_limit):
-    contact_batch = np.nan_to_num(contact_batch, nan=0.0, posinf=0.0, neginf=0.0)
-    tilt_abs = np.abs(tilt_angles)
-    alive_mask = (tilt_abs <= tilt_limit) & (~out_of_bounds_flags)
-
-    rewards = np.empty_like(tilt_angles, dtype=np.float32)
-    rewards[:] = -FALL_PENALTY
-
-    if np.any(alive_mask):
-        alive_idx = np.where(alive_mask)[0]
-        base_reward = np.full(alive_idx.shape, ALIVE_BONUS, dtype=np.float32)
-
-        if SENSOR_MATCH_BONUS > 0.0:
-            sensors = contact_batch[alive_idx]
-            spread = np.max(sensors, axis=1) - np.min(sensors, axis=1)
-            safe_tol = np.maximum(SENSOR_MATCH_TOLERANCE, 1e-8)
-            match_score = np.clip(1.0 - spread / safe_tol, 0.0, 1.0)
-            base_reward += SENSOR_MATCH_BONUS * match_score
-
-        rewards[alive_idx] = base_reward
-
-    return rewards.astype(np.float32), alive_mask
-
-
-def _make_mjx_step(model):
-    def single_step(data):
-        return mujoco.mjx.step(model, data)
-
-    @jax.jit
-    def batched_step(data, xfrc_applied, ctrl):
-        data = data.replace(xfrc_applied=xfrc_applied, ctrl=ctrl)
-        return jax.vmap(single_step)(data)
-
-    return batched_step
-
-
-class MJXParallelEnv:
+class MuJoCoParallelEnv:
     def __init__(self, model_path, batch_size):
-        self.num_envs = batch_size
-        self.model, self.xml_string = _load_sanitized_model(model_path)
-        self.mjx_model = mujoco.mjx.put_model(self.model)
-        self._step_fn = _make_mjx_step(self.mjx_model)
+        self.num_envs = int(batch_size)
+        if self.num_envs <= 0:
+            raise ValueError("batch_size must be positive")
+
+        self.model = mujoco.MjModel.from_xml_path(model_path)
+        self.datas = [mujoco.MjData(self.model) for _ in range(self.num_envs)]
+        for data in self.datas:
+            mujoco.mj_forward(self.model, data)
 
         self.nbodies = self.model.nbody
         self.nu = self.model.nu
         self.box_body_id = self.model.body('box_body').id
-
-        self.sensor_indices = np.array([
-            self.model.sensor(name).adr for name in SENSOR_NAMES
-        ], dtype=np.int32)
-        self.middle_sensor_indices = np.array(MID_ROW_INDICES, dtype=np.int32)
-        self._sensor_indices_device = jnp.asarray(self.sensor_indices)
-        self._vel_threshold = float(ANGULAR_VEL_DIRECTION_THRESHOLD)
-
-        cpu_data = mujoco.MjData(self.model)
-        mujoco.mj_forward(self.model, cpu_data)
-        self._cpu_reset_data = cpu_data
-        single_mjx_data = mujoco.mjx.put_data(self.model, cpu_data)
-
-        self.mjx_data = _replicate_mjx_data(single_mjx_data, batch_size)
-        self._default_ctrl = np.zeros((batch_size, self.nu), dtype=np.float32)
-
-        self.reset()
-
-    def _reset_single(self):
-        mujoco.mj_resetData(self.model, self._cpu_reset_data)
-        mujoco.mj_forward(self.model, self._cpu_reset_data)
-        return mujoco.mjx.put_data(self.model, self._cpu_reset_data)
-
-    def _sensor_grid(self):
-        sensor_vals = jnp.take(self.mjx_data.sensordata, self._sensor_indices_device, axis=1)
-        sensors = np.asarray(sensor_vals, dtype=np.float32)
-        if sensors.ndim == 3 and sensors.shape[-1] == 1:
-            sensors = np.squeeze(sensors, axis=-1)
-        return sensors
-
-    def _mid_row_contacts(self):
-        sensors = self._sensor_grid()
-        return sensors[:, self.middle_sensor_indices]
-
-    def _angular_velocity_direction_batch(self):
-        cvel = np.asarray(self.mjx_data.cvel[:, self.box_body_id, 1], dtype=np.float32)
-        direction = np.zeros_like(cvel)
-        direction[cvel > self._vel_threshold] = 1.0
-        direction[cvel < -self._vel_threshold] = -1.0
-        return direction
-
-    def _compute_observation_components(self):
-        mid_row = self._mid_row_contacts().astype(np.float32)
-        tilt_proxy = mid_row[:, 0] - mid_row[:, -1]
-        vel_direction = self._angular_velocity_direction_batch().astype(np.float32)
-        obs = np.stack([tilt_proxy, vel_direction], axis=1)
-        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        return obs, mid_row
+        self._contact_dim = tactile_sensors(self.datas[0]).size
 
     def reset(self, env_indices=None):
         if env_indices is None:
-            env_indices = np.arange(self.num_envs)
+            indices = range(self.num_envs)
         else:
             env_indices = np.asarray(env_indices, dtype=np.int32)
-        current = jax.tree_util.tree_map(np.asarray, jax.device_get(self.mjx_data))
-        singles = [jax.tree_util.tree_map(np.asarray, self._reset_single()) for _ in env_indices]
-        updated = _update_env_slices(current, env_indices, *singles)
-        self.mjx_data = jax.tree_util.tree_map(jnp.asarray, updated)
-        obs = self.get_observation()
-        return obs
+            if env_indices.size == 0:
+                return self.get_observation()
+            indices = env_indices.tolist()
+
+        for idx in indices:
+            data = self.datas[int(idx)]
+            mujoco.mj_resetData(self.model, data)
+            mujoco.mj_forward(self.model, data)
+
+        return self.get_observation()
 
     def get_observation(self):
-        obs, _ = self._compute_observation_components()
+        obs = np.zeros((self.num_envs, OBS_DIM), dtype=np.float32)
+        for idx, data in enumerate(self.datas):
+            obs[idx] = np.nan_to_num(
+                build_observation(data),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
         return obs
 
-    def step(self, action_forces, perturb_forces):
-        xfrc = np.zeros((self.num_envs, self.nbodies, 6), dtype=np.float32)
-        xfrc[:, self.box_body_id, 0] = action_forces
+    def step(self, action_forces, perturb_forces=None):
+        action_forces = np.asarray(action_forces, dtype=np.float32)
+        if action_forces.shape not in [(self.num_envs,), (self.num_envs, 1)]:
+            raise ValueError("action_forces must have shape (num_envs,) or (num_envs, 1)")
+        action_forces = action_forces.reshape(self.num_envs)
+
         if perturb_forces is not None:
-            xfrc[:, self.box_body_id, :] += perturb_forces
-        xfrc = jnp.asarray(xfrc)
-        ctrl = jnp.asarray(self._default_ctrl)
-        self.mjx_data = self._step_fn(self.mjx_data, xfrc, ctrl)
-        obs_features, mid_contacts = self._compute_observation_components()
-        quat = np.asarray(self.mjx_data.xquat[:, self.box_body_id], dtype=np.float32)
-        tilt_angles = _compute_tilt_angle_batch(quat)
-        tilt_rates = np.asarray(self.mjx_data.cvel[:, self.box_body_id, 1], dtype=np.float32)
-        xpos = np.asarray(self.mjx_data.xpos[:, self.box_body_id], dtype=np.float32)
-        return obs_features, mid_contacts, tilt_angles, tilt_rates, xpos
+            perturb_forces = np.asarray(perturb_forces, dtype=np.float32)
+            if perturb_forces.shape != (self.num_envs, 6):
+                raise ValueError("perturb_forces must have shape (num_envs, 6)")
+
+        obs_features = np.zeros((self.num_envs, OBS_DIM), dtype=np.float32)
+        contact_batch = np.zeros((self.num_envs, self._contact_dim), dtype=np.float32)
+        tilt_angles = np.zeros(self.num_envs, dtype=np.float32)
+        tilt_rates = np.zeros(self.num_envs, dtype=np.float32)
+        xpos = np.zeros((self.num_envs, 3), dtype=np.float32)
+        rewards = np.zeros(self.num_envs, dtype=np.float32)
+        alive_mask = np.zeros(self.num_envs, dtype=bool)
+
+        for idx in range(self.num_envs):
+            data = self.datas[idx]
+
+            data.xfrc_applied[:] = 0.0
+            data.xfrc_applied[self.box_body_id, 0] = float(action_forces[idx])
+
+            if perturb_forces is not None:
+                data.xfrc_applied[self.box_body_id] += perturb_forces[idx]
+
+            if self.nu > 0:
+                data.ctrl[:] = 0.0
+
+            mujoco.mj_step(self.model, data)
+
+            obs = build_observation(data)
+            obs_features[idx] = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+            contacts = tactile_sensors(data)
+            contact_batch[idx] = np.nan_to_num(contacts, nan=0.0, posinf=0.0, neginf=0.0)
+
+            tilt_angles[idx] = float(compute_tilt_angle(data))
+            tilt_rates[idx] = float(compute_tilt_rate(data))
+
+            xpos_val = np.asarray(data.body('box_body').xpos, dtype=np.float32)
+            xpos[idx] = xpos_val
+
+            out_of_bounds = (abs(xpos_val[0]) > BOUNDARY_LIMIT) or (abs(xpos_val[1]) > BOUNDARY_LIMIT)
+            reward, alive = compute_reward(data, action_forces[idx], TILT_LIMIT_RADIANS, out_of_bounds)
+            rewards[idx] = float(reward)
+            alive_mask[idx] = bool(alive)
+
+        return obs_features, contact_batch, tilt_angles, tilt_rates, xpos, rewards, alive_mask
 
 
 def _sample_startup_perturbation(force_range=None):
@@ -731,7 +652,7 @@ def main():
 
     NUM_ENVS = int(os.environ.get("MJX_NUM_ENVS", os.environ.get("PPO_NUM_ENVS", "32")))
     MAX_TRAINING_STEPS = 10000000
-    ROLLOUT_LENGTH = 1024
+    ROLLOUT_LENGTH = 256
     BATCH_SIZE = 128
     PPO_EPOCHS = 32
     LR = 1e-4
@@ -752,7 +673,7 @@ def main():
     latest_dir = os.path.join("pretrained", "latest")
     os.makedirs(save_root, exist_ok=True)
 
-    env = MJXParallelEnv("model.xml", NUM_ENVS)
+    env = MuJoCoParallelEnv("model.xml", NUM_ENVS)
     eval_model = mujoco.MjModel.from_xml_path("model.xml")
     data = mujoco.MjData(eval_model)
     box_body_id = data.body('box_body').id
@@ -1007,7 +928,7 @@ def main():
         f"with perturb range {describe_curriculum_range(get_curriculum_range())}"
     )
 
-    print(f"Starting PPO training with MJX across {NUM_ENVS} environments...")
+    print(f"Starting PPO training with MuJoCo across {NUM_ENVS} environments...")
 
     while total_steps < MAX_TRAINING_STEPS:
         state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device)
@@ -1046,9 +967,7 @@ def main():
             perturb_batch[active_mask] = perturb_forces[active_mask]
             perturb_steps_remaining[active_mask] -= 1
 
-        obs_features, contact_batch, tilt_angles, tilt_rates, xpos = env.step(action_forces, perturb_batch)
-        out_of_bounds = (np.abs(xpos[:, 0]) > BOUNDARY_LIMIT) | (np.abs(xpos[:, 1]) > BOUNDARY_LIMIT)
-        rewards, alive_mask = _compute_reward_batch(contact_batch, tilt_angles, tilt_rates, action_forces, out_of_bounds, TILT_LIMIT_RADIANS)
+        obs_features, _, _, _, _, rewards, alive_mask = env.step(action_forces, perturb_batch)
 
         next_episode_steps = episode_steps + 1
         timeout_mask = next_episode_steps >= MAX_EPISODE_STEPS

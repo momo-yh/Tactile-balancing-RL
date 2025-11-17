@@ -32,7 +32,7 @@ def get_observation(data):
     return build_observation(data)
 
 # Configuration
-FORCES = [200]  # forces in +x direction to test
+FORCES = [50]  # forces in +x direction to test
 # Number of simulation steps the force is actively applied (1 as requested)
 APPLIED_STEPS = 1
 # Number of steps to record after the applied impulse
@@ -108,7 +108,7 @@ def run_test():
     # Compute and print/save maxima for each force (each plotted line)
     ts = datetime.now().strftime('%Y%m%d-%H%M%S')
     print('\nMin/Max values for each force observation feature (and final x-position):')
-    feature_names = ['tilt_diff', 'ang_vel_direction']
+    feature_names = ['tilt_diff', 'angular_velocity']
     # Print header
     print(','.join(['force'] + [f"{name}_min" for name in feature_names] + [f"{name}_max" for name in feature_names]))
     for f in FORCES:
@@ -144,7 +144,7 @@ def run_test():
     xs = np.arange(1, total_steps + 1)
 
     # Names for observation features
-    feature_labels = ['tilt_diff', 'ang_vel_direction']
+    feature_labels = ['tilt_diff', 'angular_velocity']
 
     # Create 3 subplots: two observation features + one for box x-position
     fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)

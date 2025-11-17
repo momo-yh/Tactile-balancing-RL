@@ -282,7 +282,7 @@ def run_validation(
 
                 if obs_feats.size > 0:
                     ax_obs.plot(xs, obs_feats[:, 0], color='tab:purple', label='tilt_diff (p1_0 - m1_0)')
-                    ax_obs.step(xs, obs_feats[:, 1], where='post', color='tab:orange', linewidth=1.2, label='ang_vel_direction')
+                    ax_obs.plot(xs, obs_feats[:, 1], color='tab:orange', linewidth=1.2, label='angular_velocity')
                     ax_obs.set_ylabel('Observation features')
                     ax_obs.legend()
                     ax_obs.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
