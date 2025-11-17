@@ -4,7 +4,7 @@ import os
 # Shared environment-configurable parameters used by training and validation
 
 # Observation / stacking
-STACK_SIZE = int(os.environ.get("STACK_SIZE", "1"))
+STACK_SIZE = int(os.environ.get("STACK_SIZE", "2"))
 OBS_DIM = int(os.environ.get("OBS_DIM", "2"))
 STATE_DIM = OBS_DIM * STACK_SIZE
 

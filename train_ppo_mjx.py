@@ -651,7 +651,7 @@ def main():
     args = parser.parse_args()
 
     NUM_ENVS = int(os.environ.get("MJX_NUM_ENVS", os.environ.get("PPO_NUM_ENVS", "32")))
-    MAX_TRAINING_STEPS = 10000000
+    MAX_TRAINING_STEPS = 5000000
     ROLLOUT_LENGTH = 256
     BATCH_SIZE = 128
     PPO_EPOCHS = 32
