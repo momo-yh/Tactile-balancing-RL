@@ -15,10 +15,9 @@ ANGVEL_BONUS = float(
 ANGVEL_TOLERANCE = float(
     os.environ.get(
         "ANGVEL_TOLERANCE",
-        os.environ.get("SENSOR_MATCH_TOLERANCE", "1.0"),
+        os.environ.get("SENSOR_MATCH_TOLERANCE", "0.1"),
     )
 )
-ANGVEL_DECAY_POWER = float(os.environ.get("ANGVEL_DECAY_POWER", "2.0"))
 
 
 def compute_reward(data, action_force, tilt_limit_rad, out_of_bounds=False):
@@ -26,7 +25,7 @@ def compute_reward(data, action_force, tilt_limit_rad, out_of_bounds=False):
 
         Components:
             + alive bonus while |tilt| <= tilt_limit_rad and within bounds
-            + angular velocity bonus that decays as |d(tilt)/dt| grows
+            + angular velocity bonus that shrinks linearly with |d(tilt)/dt|
             - fall penalty once the agent exceeds the tilt limit or leaves bounds
 
     Args:
@@ -47,8 +46,8 @@ def compute_reward(data, action_force, tilt_limit_rad, out_of_bounds=False):
         if ANGVEL_BONUS > 0.0:
             angular_velocity = abs(float(compute_tilt_rate(data)))
             normalized_rate = angular_velocity / max(ANGVEL_TOLERANCE, 1e-8)
-            smooth_factor = float(np.exp(-np.power(normalized_rate, ANGVEL_DECAY_POWER)))
-            reward += ANGVEL_BONUS * smooth_factor
+            linear_factor = float(np.clip(1.0 - normalized_rate, 0.0, 1.0))
+            reward += ANGVEL_BONUS * linear_factor
         return float(reward), True
 
     return -FALL_PENALTY, False
